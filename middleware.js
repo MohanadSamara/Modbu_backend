@@ -9,7 +9,28 @@
  *                            req.params / req.query when relevant)
  */
 
-const { verifyAccessToken, userHasPermission } = require('./auth');
+const { verifyAccessToken, userHasPermission, userHasAnyPermission } = require('./auth');
+
+/**
+ * Pull the scope the request targets out of body / params / query.
+ * Roles can be scoped to a project, a location, or a single device; a request
+ * carries whichever ids it operates on. userHasPermission then widens this to
+ * the full chain (a device belongs to a location belongs to a project).
+ */
+function _extractScope(req) {
+  const num = (v) => {
+    const n = Number(v);
+    return Number.isInteger(n) && n > 0 ? n : null;
+  };
+  return {
+    projectId:
+      num(req.body?.project_id) || num(req.params?.projectId) || num(req.query?.project_id) || null,
+    locationId:
+      num(req.body?.location_id) || num(req.params?.locationId) || num(req.query?.location_id) || null,
+    deviceId:
+      num(req.body?.device_id) || num(req.params?.deviceId) || num(req.query?.device_id) || null,
+  };
+}
 
 function _extractToken(req) {
   const h = req.headers.authorization || req.headers.Authorization;
@@ -52,14 +73,8 @@ function requirePermission(permissionKey) {
       return res.status(401).json({ error: 'Authentication required', code: 'AUTH_MISSING' });
     }
 
-    const projectId =
-      Number(req.body?.project_id) ||
-      Number(req.params?.projectId) ||
-      Number(req.query?.project_id) ||
-      null;
-
     try {
-      const ok = await userHasPermission(req.user.id, permissionKey, projectId || null);
+      const ok = await userHasPermission(req.user.id, permissionKey, _extractScope(req));
       if (!ok) {
         return res.status(403).json({
           error: `Forbidden: missing permission ${permissionKey}`,
@@ -75,4 +90,33 @@ function requirePermission(permissionKey) {
   };
 }
 
-module.exports = { authenticate, optionalAuthenticate, requirePermission };
+/**
+ * Pass if the user holds ANY of `permissionKeys` for the request's scope.
+ * Used where a granular key and a legacy bundled key are both acceptable —
+ * e.g. START is allowed by either 'device.start' or the legacy 'device.control'.
+ */
+function requireAnyPermission(permissionKeys) {
+  const keys = Array.isArray(permissionKeys) ? permissionKeys : [permissionKeys];
+  return async (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required', code: 'AUTH_MISSING' });
+    }
+
+    try {
+      const ok = await userHasAnyPermission(req.user.id, keys, _extractScope(req));
+      if (!ok) {
+        return res.status(403).json({
+          error: `Forbidden: missing permission (need one of: ${keys.join(', ')})`,
+          code: 'AUTH_FORBIDDEN',
+          requiredPermission: keys,
+        });
+      }
+      next();
+    } catch (err) {
+      console.error('[Auth] requireAnyPermission error:', err.message);
+      res.status(500).json({ error: 'Permission check failed' });
+    }
+  };
+}
+
+module.exports = { authenticate, optionalAuthenticate, requirePermission, requireAnyPermission };

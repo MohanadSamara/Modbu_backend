@@ -9,7 +9,7 @@
  *   POST   /api/users/:id/reset-password   { newPassword }    (user.write)
  *   POST   /api/users/:id/lock        -> disable account      (user.write)
  *   POST   /api/users/:id/unlock      -> re-enable account    (user.write)
- *   POST   /api/users/:id/roles       { roleKey, projectId? } -> grant role    (user.assign_role)
+ *   POST   /api/users/:id/roles       { roleKey, projectId? | locationId? | deviceId? } -> grant role (user.assign_role)
  *   DELETE /api/users/:id/roles/:userRoleId -> revoke role    (user.assign_role)
  *
  *   GET    /api/roles                 -> list roles           (user.read)
@@ -76,7 +76,8 @@ router.get('/users/:id', requirePermission('user.read'), async (req, res) => {
     if (userRows.length === 0) return res.status(404).json({ error: 'User not found' });
 
     const roleRows = await query(
-      `SELECT ur.user_role_id, r.role_key, r.role_name, ur.project_id, ur.granted_at
+      `SELECT ur.user_role_id, r.role_key, r.role_name,
+              ur.project_id, ur.location_id, ur.device_id, ur.granted_at
          FROM MODBUS_ADMIN.user_roles ur
          JOIN MODBUS_ADMIN.roles      r ON r.role_id = ur.role_id
         WHERE ur.user_id = :id
@@ -99,6 +100,8 @@ router.get('/users/:id', requirePermission('user.read'), async (req, res) => {
         key:        r.ROLE_KEY,
         name:       r.ROLE_NAME,
         projectId:  r.PROJECT_ID,
+        locationId: r.LOCATION_ID,
+        deviceId:   r.DEVICE_ID,
         grantedAt:  r.GRANTED_AT,
       })),
     });
@@ -281,8 +284,15 @@ router.post('/users/:id/unlock', requirePermission('user.write'), async (req, re
 router.post('/users/:id/roles', requirePermission('user.assign_role'), async (req, res) => {
   const id = parseInt(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid user id' });
-  const { roleKey, projectId } = req.body || {};
+  const { roleKey, projectId, locationId, deviceId } = req.body || {};
   if (!roleKey) return res.status(400).json({ error: 'roleKey is required' });
+
+  // A grant is scoped to at most ONE level: global, project, location, or
+  // device. Mixing levels is ambiguous, so reject it up front.
+  const scopes = [projectId, locationId, deviceId].filter(v => v !== undefined && v !== null && v !== '');
+  if (scopes.length > 1) {
+    return res.status(400).json({ error: 'Provide only one of projectId, locationId, or deviceId' });
+  }
 
   const conn = await getConnection();
   if (!conn) return res.status(503).json({ error: 'DB unavailable' });
@@ -295,9 +305,16 @@ router.post('/users/:id/roles', requirePermission('user.assign_role'), async (re
     const roleId = roleRes.rows[0][0];
 
     await conn.execute(
-      `INSERT INTO MODBUS_ADMIN.user_roles (user_id, role_id, project_id, granted_by)
-       VALUES (:userId, :rid, :projectId, :grantedBy)`,
-      { userId: id, rid: roleId, projectId: projectId || null, grantedBy: req.user.id },
+      `INSERT INTO MODBUS_ADMIN.user_roles (user_id, role_id, project_id, location_id, device_id, granted_by)
+       VALUES (:userId, :rid, :projectId, :locationId, :deviceId, :grantedBy)`,
+      {
+        userId: id,
+        rid: roleId,
+        projectId:  projectId  || null,
+        locationId: locationId || null,
+        deviceId:   deviceId   || null,
+        grantedBy: req.user.id,
+      },
       { autoCommit: true }
     );
     invalidateUserPermsCache(id);
@@ -307,7 +324,7 @@ router.post('/users/:id/roles', requirePermission('user.assign_role'), async (re
       return res.status(409).json({ error: 'User already has that role with that scope' });
     }
     if (/ORA-02291/i.test(e.message)) {
-      return res.status(400).json({ error: 'Invalid user_id or project_id' });
+      return res.status(400).json({ error: 'Invalid user_id, project_id, location_id, or device_id' });
     }
     console.error('POST /api/users/:id/roles error:', e.message);
     res.status(500).json({ error: e.message });
