@@ -331,10 +331,10 @@ async function logAudit({ userId, usernameTry, eventType, ip, userAgent, detail 
 
 // ── Permission lookup (inline JOIN — no view needed) ──────────────────────
 //
-// Cached per (userId, permKey, projectId) for PERMS_CACHE_MS so the same
+// Cached per (userId, permKey, scope) for PERMS_CACHE_MS so the same
 // request -> middleware -> route doesn't run the JOIN multiple times. Cache
 // is invalidated when roles change (see invalidateUserPermsCache).
-const _permsCache = new Map(); // `${uid}|${perm}|${pid}` -> { ok, ts }
+const _permsCache = new Map(); // `${uid}|${perm}|${pid}|${lid}|${did}` -> { ok, ts }
 const PERMS_CACHE_MS = 30_000;
 
 function invalidateUserPermsCache(userId) {
@@ -348,29 +348,126 @@ function invalidateUserPermsCache(userId) {
   }
 }
 
-async function userHasPermission(userId, permissionKey, projectId = null) {
-  const key = `${userId}|${permissionKey}|${projectId ?? ''}`;
-  const cached = _permsCache.get(key);
+/**
+ * Normalise the scope argument. Callers may pass either a bare projectId
+ * (legacy signature) or an object { projectId, locationId, deviceId }.
+ */
+function _normalizeScope(scope) {
+  if (scope === null || scope === undefined) return { projectId: null, locationId: null, deviceId: null };
+  if (typeof scope === 'object') {
+    return {
+      projectId:  scope.projectId  ?? null,
+      locationId: scope.locationId ?? null,
+      deviceId:   scope.deviceId   ?? null,
+    };
+  }
+  return { projectId: scope, locationId: null, deviceId: null }; // legacy number
+}
+
+/**
+ * Resolve the full scope chain of the target the request is about.
+ *
+ * A grant can be attached at any level (project / location / device). To let a
+ * broad grant cover everything beneath it we need the *effective* ids the
+ * target belongs to. Given a deviceId we look up its location and that
+ * location's project; given a locationId we look up its project. Explicit ids
+ * passed by the caller always win.
+ */
+async function _resolveScopeChain({ projectId, locationId, deviceId }) {
+  if (!deviceId && !locationId) return { projectId, locationId, deviceId };
+
+  const conn = await getConnection();
+  if (!conn) return { projectId, locationId, deviceId };
+  try {
+    if (deviceId) {
+      const r = await conn.execute(
+        `SELECT d.location_id, l.project_id
+           FROM MODBUS_ADMIN.devices d
+           LEFT JOIN MODBUS_ADMIN.locations l ON l.id = d.location_id
+          WHERE d.device_id = :deviceId`,
+        { deviceId },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+      const row = (r.rows || [])[0];
+      if (row) {
+        locationId = locationId ?? row.LOCATION_ID ?? null;
+        projectId  = projectId  ?? row.PROJECT_ID  ?? null;
+      }
+    } else if (locationId) {
+      const r = await conn.execute(
+        `SELECT project_id FROM MODBUS_ADMIN.locations WHERE id = :locationId`,
+        { locationId },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+      const row = (r.rows || [])[0];
+      if (row) projectId = projectId ?? row.PROJECT_ID ?? null;
+    }
+  } catch (err) {
+    console.warn('[Auth] scope resolution failed:', err.message);
+  } finally {
+    await conn.close().catch(() => {});
+  }
+  return { projectId, locationId, deviceId };
+}
+
+/**
+ * Does `userId` hold ANY of `permissionKeys`, for the given scope?
+ *
+ * A role assignment satisfies the check when it grants the permission AND its
+ * own scope is broad enough to cover the target:
+ *   - fully global grant (project/location/device all NULL), OR
+ *   - project_id  matches the target's (effective) project, OR
+ *   - location_id matches the target's (effective) location, OR
+ *   - device_id   matches the target device.
+ */
+async function userHasAnyPermission(userId, permissionKeys, scope = null) {
+  const keys = Array.isArray(permissionKeys) ? permissionKeys : [permissionKeys];
+  if (keys.length === 0) return false;
+
+  const raw = _normalizeScope(scope);
+  const eff = await _resolveScopeChain(raw);
+
+  const cacheKey =
+    `${userId}|${keys.join(',')}|${eff.projectId ?? ''}|${eff.locationId ?? ''}|${eff.deviceId ?? ''}`;
+  const cached = _permsCache.get(cacheKey);
   if (cached && (Date.now() - cached.ts) < PERMS_CACHE_MS) return cached.ok;
 
   const conn = await getConnection();
   if (!conn) return false;
   try {
+    // Build an IN-list of bind placeholders for the permission keys.
+    const permBinds = {};
+    const placeholders = keys.map((k, i) => {
+      permBinds[`perm${i}`] = k;
+      return `:perm${i}`;
+    });
+
     const r = await conn.execute(
       `SELECT 1
          FROM MODBUS_ADMIN.user_roles       ur
          JOIN MODBUS_ADMIN.role_permissions rp ON rp.role_id      = ur.role_id
          JOIN MODBUS_ADMIN.permissions      p  ON p.permission_id = rp.permission_id
          JOIN MODBUS_ADMIN.users            u  ON u.user_id       = ur.user_id
-        WHERE u.status         = 'active'
-          AND ur.user_id       = :userId
-          AND p.permission_key = :permKey
-          AND (ur.project_id IS NULL OR ur.project_id = :projectId)
+        WHERE u.status          = 'active'
+          AND ur.user_id        = :userId
+          AND p.permission_key IN (${placeholders.join(', ')})
+          AND (
+                (ur.project_id IS NULL AND ur.location_id IS NULL AND ur.device_id IS NULL)
+             OR (ur.device_id   IS NOT NULL AND ur.device_id   = :deviceId)
+             OR (ur.location_id IS NOT NULL AND ur.location_id = :locationId)
+             OR (ur.project_id  IS NOT NULL AND ur.project_id  = :projectId)
+          )
           AND ROWNUM = 1`,
-      { userId, permKey: permissionKey, projectId: projectId ?? null }
+      {
+        userId,
+        ...permBinds,
+        projectId:  eff.projectId  ?? null,
+        locationId: eff.locationId ?? null,
+        deviceId:   eff.deviceId   ?? null,
+      }
     );
     const ok = (r.rows || []).length > 0;
-    _permsCache.set(key, { ok, ts: Date.now() });
+    _permsCache.set(cacheKey, { ok, ts: Date.now() });
     return ok;
   } catch (err) {
     console.error('[Auth] permission check failed:', err.message);
@@ -378,6 +475,14 @@ async function userHasPermission(userId, permissionKey, projectId = null) {
   } finally {
     await conn.close().catch(() => {});
   }
+}
+
+/**
+ * Single-permission convenience wrapper. `scope` may be a bare projectId
+ * (legacy) or { projectId, locationId, deviceId }.
+ */
+async function userHasPermission(userId, permissionKey, scope = null) {
+  return userHasAnyPermission(userId, [permissionKey], scope);
 }
 
 /**
@@ -390,7 +495,7 @@ async function getUserRolesAndPermissions(userId) {
   try {
     const [rolesRes, permsRes] = await Promise.all([
       conn.execute(
-        `SELECT r.role_key, r.role_name, ur.project_id
+        `SELECT r.role_key, r.role_name, ur.project_id, ur.location_id, ur.device_id
            FROM MODBUS_ADMIN.user_roles ur
            JOIN MODBUS_ADMIN.roles      r ON r.role_id = ur.role_id
           WHERE ur.user_id = :userId`,
@@ -398,7 +503,7 @@ async function getUserRolesAndPermissions(userId) {
         { outFormat: oracledb.OUT_FORMAT_OBJECT }
       ),
       conn.execute(
-        `SELECT DISTINCT p.permission_key, ur.project_id
+        `SELECT DISTINCT p.permission_key, ur.project_id, ur.location_id, ur.device_id
            FROM MODBUS_ADMIN.user_roles       ur
            JOIN MODBUS_ADMIN.role_permissions rp ON rp.role_id      = ur.role_id
            JOIN MODBUS_ADMIN.permissions      p  ON p.permission_id = rp.permission_id
@@ -409,10 +514,12 @@ async function getUserRolesAndPermissions(userId) {
     ]);
     return {
       roles: (rolesRes.rows || []).map(r => ({
-        key: r.ROLE_KEY, name: r.ROLE_NAME, projectId: r.PROJECT_ID,
+        key: r.ROLE_KEY, name: r.ROLE_NAME,
+        projectId: r.PROJECT_ID, locationId: r.LOCATION_ID, deviceId: r.DEVICE_ID,
       })),
       permissions: (permsRes.rows || []).map(r => ({
-        key: r.PERMISSION_KEY, projectId: r.PROJECT_ID,
+        key: r.PERMISSION_KEY,
+        projectId: r.PROJECT_ID, locationId: r.LOCATION_ID, deviceId: r.DEVICE_ID,
       })),
     };
   } finally {
@@ -441,6 +548,7 @@ module.exports = {
   logAudit,
   // RBAC
   userHasPermission,
+  userHasAnyPermission,
   getUserRolesAndPermissions,
   invalidateUserPermsCache,
   // constants

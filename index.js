@@ -14,7 +14,7 @@ const { initPool, closePool, getConnection, logDeviceAction, logFuelReading, get
 const { query, execute } = require('./db-helpers');
 const authRoutes  = require('./routes-auth');
 const userRoutes  = require('./routes-users');
-const { authenticate, requirePermission } = require('./middleware');
+const { authenticate, requirePermission, requireAnyPermission } = require('./middleware');
 const cors = require('cors');
 const app = express();
 
@@ -370,7 +370,7 @@ app.get('/api/modbus/connect', authenticate, requirePermission('device.connect')
   }
 });
 
-app.get('/api/modbus/start', authenticate, requirePermission('device.control'), async (_, res) => {
+app.get('/api/modbus/start', authenticate, requireAnyPermission(['device.start', 'device.control']), async (_, res) => {
   if (!isConnected()) return res.status(503).json({ error: 'No connection' });
   try {
     await startButton();
@@ -381,7 +381,7 @@ app.get('/api/modbus/start', authenticate, requirePermission('device.control'), 
   }
 });
 
-app.get('/api/modbus/stop', authenticate, requirePermission('device.control'), async (_, res) => {
+app.get('/api/modbus/stop', authenticate, requireAnyPermission(['device.stop', 'device.control']), async (_, res) => {
   if (!isConnected()) return res.status(503).json({ error: 'No connection' });
   try {
     const ok = await stopButton();
