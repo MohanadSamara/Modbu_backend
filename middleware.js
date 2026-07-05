@@ -10,6 +10,7 @@
  */
 
 const { verifyAccessToken, userHasPermission, userHasAnyPermission } = require('./auth');
+const { query } = require('./db-helpers');
 
 /**
  * Pull the scope the request targets out of body / params / query.
@@ -119,4 +120,81 @@ function requireAnyPermission(permissionKeys) {
   };
 }
 
-module.exports = { authenticate, optionalAuthenticate, requirePermission, requireAnyPermission };
+// ============================================================================
+// Dynamic, data-driven enforcement.
+//
+// Admins can map a permission to the API routes it protects (permission_endpoints
+// table). This middleware enforces those mappings ADDITIVELY: it can only ADD a
+// requirement to a route, never remove the built-in code guard. So a bad mapping
+// can't open a protected endpoint or lock anyone out of an un-mapped route.
+// ============================================================================
+let _endpointCache = { rows: null, at: 0 };
+const ENDPOINT_TTL_MS = 10000; // reload mappings at most every 10s
+
+function invalidateEndpointCache() {
+  _endpointCache = { rows: null, at: 0 };
+}
+
+// Convert an express-style path ('/api/locations/:id') into an anchored regex.
+function _patternToRegex(pattern) {
+  const escaped = String(pattern)
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&') // escape regex metachars
+    .replace(/\/:[^/]+/g, '/[^/]+');        // :param → one path segment
+  return new RegExp('^' + escaped + '/?$');
+}
+
+async function _loadEndpoints() {
+  const now = Date.now();
+  if (_endpointCache.rows && now - _endpointCache.at < ENDPOINT_TTL_MS) {
+    return _endpointCache.rows;
+  }
+  const rows = await query(
+    `SELECT permission_key, http_method, path_pattern FROM MODBUS_ADMIN.permission_endpoints`
+  );
+  const parsed = (rows || []).map((r) => ({
+    key: r.PERMISSION_KEY,
+    method: String(r.HTTP_METHOD || 'ANY').toUpperCase(),
+    regex: _patternToRegex(r.PATH_PATTERN),
+  }));
+  _endpointCache = { rows: parsed, at: now };
+  return parsed;
+}
+
+async function enforceMappedPermissions(req, res, next) {
+  try {
+    if (!req.user) return next(); // unauthenticated → the route's own guard handles it
+    const path = req.path || (req.url || '').split('?')[0];
+    const method = (req.method || 'GET').toUpperCase();
+
+    const eps = await _loadEndpoints();
+    const matched = eps.filter(
+      (e) => (e.method === 'ANY' || e.method === method) && e.regex.test(path)
+    );
+    if (matched.length === 0) return next(); // no mapping for this route
+
+    const keys = [...new Set(matched.map((e) => e.key))];
+    const ok = await userHasAnyPermission(req.user.id, keys, _extractScope(req));
+    if (!ok) {
+      return res.status(403).json({
+        error: `Forbidden: missing permission (need one of: ${keys.join(', ')})`,
+        code: 'AUTH_FORBIDDEN',
+        requiredPermission: keys,
+      });
+    }
+    return next();
+  } catch (err) {
+    // Fail-open: the built-in code guards still protect routes, so a mapping
+    // lookup failure must never take the whole API down.
+    console.error('[Auth] enforceMappedPermissions error:', err.message);
+    return next();
+  }
+}
+
+module.exports = {
+  authenticate,
+  optionalAuthenticate,
+  requirePermission,
+  requireAnyPermission,
+  enforceMappedPermissions,
+  invalidateEndpointCache,
+};

@@ -212,6 +212,8 @@ INSERT INTO MODBUS_ADMIN.permissions (permission_key, description) VALUES ('fuel
 INSERT INTO MODBUS_ADMIN.permissions (permission_key, description) VALUES ('alarm.read',      'View alarms');
 INSERT INTO MODBUS_ADMIN.permissions (permission_key, description) VALUES ('project.read',    'View projects/locations');
 INSERT INTO MODBUS_ADMIN.permissions (permission_key, description) VALUES ('project.write',   'Create/update/delete projects/locations');
+INSERT INTO MODBUS_ADMIN.permissions (permission_key, description) VALUES ('location.read',   'View locations');
+INSERT INTO MODBUS_ADMIN.permissions (permission_key, description) VALUES ('location.write',  'Create/update/delete locations');
 INSERT INTO MODBUS_ADMIN.permissions (permission_key, description) VALUES ('settings.read',   'View system/device settings');
 INSERT INTO MODBUS_ADMIN.permissions (permission_key, description) VALUES ('settings.write',  'Modify system/device settings');
 INSERT INTO MODBUS_ADMIN.permissions (permission_key, description) VALUES ('user.read',       'View users');
@@ -240,6 +242,7 @@ SELECT r.role_id, p.permission_id
         'device.read','device.write','device.connect','device.control',
         'fuel.read','alarm.read',
         'project.read','project.write',
+        'location.read','location.write',
         'settings.read','settings.write'
     )
  WHERE r.role_key = 'operator';
@@ -250,7 +253,7 @@ SELECT r.role_id, p.permission_id
   FROM MODBUS_ADMIN.roles r
   JOIN MODBUS_ADMIN.permissions p
     ON p.permission_key IN (
-        'device.read','fuel.read','alarm.read','project.read','settings.read'
+        'device.read','fuel.read','alarm.read','project.read','location.read','settings.read'
     )
  WHERE r.role_key = 'viewer';
 
