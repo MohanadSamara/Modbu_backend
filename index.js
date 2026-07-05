@@ -1,20 +1,30 @@
 const express = require('express');
 const readline = require('readline');
 
-// Globals
+// CLI-only globals: which device the interactive menu is pointed at. HTTP
+// requests are per-device (addressed by ?device_id=) and never rely on these.
 let currentDeviceConfig = null;
 let currentDeviceId = null;
-let modbusClient;
 let lastConnectAttemptAt = 0;
-const CONNECT_RETRY_COOLDOWN_MS = 5000;
 
 require('dotenv').config();
-const { connectModbus, disconnectModbus, getSession, isConnected, getClient, stopButton, startButton, readFuel, getDeviceConfig } = require('./modbus_connect');
+const { connectModbus, disconnectModbus, closeAll, getSession, isConnected, stopButton, startButton, readFuel, readGps, getDeviceConfig } = require('./modbus_connect');
+
+// Build a per-device target ({ deviceId | ip, port }) from request query params.
+// Every read/write op is addressed to a specific device's connection so two
+// users never operate on each other's device.
+function targetFromReq(req) {
+  const deviceId = req.query.device_id ? parseInt(req.query.device_id) : null;
+  const ip = req.query.ip || null;
+  const port = req.query.port ? parseInt(req.query.port) : undefined;
+  return { deviceId, ip, port };
+}
 const { initPool, closePool, getConnection, logDeviceAction, logFuelReading, getConsumptionRate, checkFuelAlarms } = require('./db');
 const { query, execute } = require('./db-helpers');
 const authRoutes  = require('./routes-auth');
 const userRoutes  = require('./routes-users');
-const { authenticate, requirePermission, requireAnyPermission } = require('./middleware');
+const { authenticate, requirePermission, requireAnyPermission, optionalAuthenticate, enforceMappedPermissions } = require('./middleware');
+const { visibleProjects, visibleLocationIds, filterVisibleDevices } = require('./nav-scope');
 const cors = require('cors');
 const app = express();
 
@@ -25,6 +35,11 @@ app.use(cors({
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Data-driven authorization: enforce admin-defined permission→endpoint mappings
+// on top of the built-in route guards. Runs after body parsing so it can read
+// project/location/device ids from the request for scoped checks.
+app.use(optionalAuthenticate, enforceMappedPermissions);
 
 // CLI Full Menu
 function printMenu() {
@@ -53,7 +68,6 @@ async function menuConnectDevice() {
     if (config) {
       const result = await connectModbus(deviceId);
       if (result.ok) {
-        modbusClient = getClient();
         currentDeviceConfig = config;
         currentDeviceId = config.device_id;
         console.log(`✅ Connected ${config.name}`);
@@ -72,7 +86,6 @@ async function menuConnectManual() {
   try {
     const result = await connectModbus(null, ip, port);
     if (result.ok) {
-      modbusClient = getClient();
       currentDeviceConfig = { name: 'Manual', ip, port };
       currentDeviceId = null;
       console.log(`✅ Manual ${ip}:${port}`);
@@ -84,16 +97,23 @@ async function menuConnectManual() {
   }
 }
 
+// The device the CLI is currently pointed at, as a hub target.
+function cliTarget() {
+  if (currentDeviceId) return { deviceId: currentDeviceId };
+  if (currentDeviceConfig?.ip) return { ip: currentDeviceConfig.ip, port: currentDeviceConfig.port };
+  return {};
+}
+
 function menuStatus() {
-  console.log(isConnected() ? 'Connected' : 'Disconnected');
+  console.log(isConnected(cliTarget()) ? 'Connected' : 'Disconnected');
   console.log('ID:', currentDeviceId || 'N/A');
   console.log('Config:', JSON.stringify(currentDeviceConfig || null));
 }
 
 async function menuStart() {
-  if (!isConnected()) return console.log('Connect first!');
+  if (!isConnected(cliTarget())) return console.log('Connect first!');
   try {
-    await startButton();
+    await startButton(cliTarget());
     if (currentDeviceId) await logDeviceAction(currentDeviceId, 'START');
     console.log('Start OK');
   } catch (err) {
@@ -102,9 +122,9 @@ async function menuStart() {
 }
 
 async function menuStop() {
-  if (!isConnected()) return console.log('Connect first!');
+  if (!isConnected(cliTarget())) return console.log('Connect first!');
   try {
-    const ok = await stopButton();
+    const ok = await stopButton(cliTarget());
     if (ok && currentDeviceId) await logDeviceAction(currentDeviceId, 'STOP');
     console.log(ok ? 'Stop OK' : 'Stop fail');
   } catch (err) {
@@ -113,9 +133,9 @@ async function menuStop() {
 }
 
 async function menuFuel() {
-  if (!isConnected()) return console.log('Connect first!');
+  if (!isConnected(cliTarget())) return console.log('Connect first!');
   try {
-    const f = await readFuel();
+    const f = await readFuel(cliTarget());
     console.log('Fuel:', f ? f + '%' : 'Fail');
   } catch (err) {
     console.log('Fuel fail:', err.message);
@@ -123,7 +143,7 @@ async function menuFuel() {
 }
 
 async function menuDisconnect() {
-  if (modbusClient) await modbusClient.close();
+  await disconnectModbus(cliTarget());
   currentDeviceConfig = currentDeviceId = null;
   console.log('Disconnected');
 }
@@ -233,10 +253,11 @@ app.get('/api/stats', authenticate, requirePermission('device.read'), async (req
 const CHILD_TABLES = [
   'MODBUS_ADMIN.device_readings',
   'MODBUS_ADMIN.device_actions',
+  'MODBUS_ADMIN.device_settings',
 ];
 
-app.delete('/api/devices/:id', authenticate, requirePermission('device.write'), async (req, res) => {
-  const rawId = req.params.id;
+app.delete('/api/devices/:deviceId', authenticate, requirePermission('device.write'), async (req, res) => {
+  const rawId = req.params.deviceId;
   const deviceId = Number.parseInt(rawId, 10);
 
   if (!Number.isInteger(deviceId) || deviceId <= 0) {
@@ -328,13 +349,14 @@ app.get('/api/modbus/connect', authenticate, requirePermission('device.connect')
       lastConnectAttemptAt = Date.now();
 
       if (result.ok) {
-        modbusClient = getClient();
         currentDeviceConfig = config;
         currentDeviceId = deviceId;
         // Pre-warm thresholds cache so the first /fuel poll's background
         // work is just an INSERT (no SELECT for thresholds).
         getEffectiveThresholds(deviceId).catch(() => {});
-        return res.json({ success: true, device: currentDeviceConfig });
+        // Fire-and-forget: read live GPS and store it so the map is up to date.
+        backgroundGpsRead(deviceId);
+        return res.json({ success: true, device: config });
       }
 
       return res.status(503).json({
@@ -348,10 +370,9 @@ app.get('/api/modbus/connect', authenticate, requirePermission('device.connect')
       lastConnectAttemptAt = Date.now();
 
       if (result.ok) {
-        modbusClient = getClient();
         currentDeviceConfig = { name: 'Manual', ip, port };
         currentDeviceId = null;
-        return res.json({ success: true, device: currentDeviceConfig });
+        return res.json({ success: true, device: { name: 'Manual', ip, port } });
       }
 
       return res.status(503).json({
@@ -370,34 +391,39 @@ app.get('/api/modbus/connect', authenticate, requirePermission('device.connect')
   }
 });
 
-app.get('/api/modbus/start', authenticate, requireAnyPermission(['device.start', 'device.control']), async (_, res) => {
-  if (!isConnected()) return res.status(503).json({ error: 'No connection' });
+app.get('/api/modbus/start', authenticate, requireAnyPermission(['device.start', 'device.control']), async (req, res) => {
+  const target = targetFromReq(req);
+  if (!isConnected(target)) return res.status(503).json({ error: 'No connection' });
   try {
-    await startButton();
-    if (currentDeviceId) await logDeviceAction(currentDeviceId, 'START');
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get('/api/modbus/stop', authenticate, requireAnyPermission(['device.stop', 'device.control']), async (_, res) => {
-  if (!isConnected()) return res.status(503).json({ error: 'No connection' });
-  try {
-    const ok = await stopButton();
-    if (ok && currentDeviceId) await logDeviceAction(currentDeviceId, 'STOP');
+    const ok = await startButton(target);
+    if (ok && target.deviceId) await logDeviceAction(target.deviceId, 'START');
     res.json({ success: ok });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-app.get('/api/modbus/disconnect', authenticate, requirePermission('device.connect'), async (_, res) => {
+app.get('/api/modbus/stop', authenticate, requireAnyPermission(['device.stop', 'device.control']), async (req, res) => {
+  const target = targetFromReq(req);
+  if (!isConnected(target)) return res.status(503).json({ error: 'No connection' });
   try {
-    await disconnectModbus();   // clears session + disables auto-reconnect
-    modbusClient        = null;
-    currentDeviceConfig = null;
-    currentDeviceId     = null;
+    const ok = await stopButton(target);
+    if (ok && target.deviceId) await logDeviceAction(target.deviceId, 'STOP');
+    res.json({ success: ok });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/modbus/disconnect', authenticate, requirePermission('device.connect'), async (req, res) => {
+  try {
+    const target = targetFromReq(req);
+    await disconnectModbus(target);   // closes only this device's hub
+    // Clear the CLI globals only if they pointed at the same device.
+    if (target.deviceId && target.deviceId === currentDeviceId) {
+      currentDeviceConfig = null;
+      currentDeviceId     = null;
+    }
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -494,36 +520,6 @@ async function getEffectiveThresholds(deviceId) {
 // the snapshot for the next call.
 const _lastAlarmInfo = new Map();   // deviceId -> { triggered, consumption, ts }
 let _bgInflight = new Map();        // deviceId -> Promise (dedup background work)
-let _reconnectInflight = null;      // single in-flight reconnect attempt
-
-function _kickReconnect() {
-  // Non-blocking auto-reconnect. Only one attempt at a time, throttled
-  // by CONNECT_RETRY_COOLDOWN_MS so we never thrash the device.
-  if (_reconnectInflight) return;
-  const now = Date.now();
-  if (now - lastConnectAttemptAt < CONNECT_RETRY_COOLDOWN_MS) return;
-  lastConnectAttemptAt = now;
-
-  _reconnectInflight = (async () => {
-    try {
-      let result;
-      if (currentDeviceId) {
-        result = await connectModbus(currentDeviceId);
-      } else if (currentDeviceConfig?.ip) {
-        result = await connectModbus(null, currentDeviceConfig.ip, currentDeviceConfig.port || 502);
-      } else {
-        result = await connectModbus();
-      }
-      if (result && result.ok) {
-        modbusClient = getClient();
-      }
-    } catch (err) {
-      console.warn('[Fuel] background reconnect failed:', err.message);
-    } finally {
-      _reconnectInflight = null;
-    }
-  })();
-}
 
 function _backgroundFuelWork(deviceId, fuelValue) {
   // Coalesce: if we're already running a background pass for this device,
@@ -557,27 +553,21 @@ function _backgroundFuelWork(deviceId, fuelValue) {
   _bgInflight.set(deviceId, p);
 }
 
-app.get('/api/modbus/fuel', authenticate, requirePermission('fuel.read'), async (_, res) => {
+app.get('/api/modbus/fuel', authenticate, requirePermission('fuel.read'), async (req, res) => {
+  const target = targetFromReq(req);
   try {
-    if (!isConnected()) {
-      // Cold path: kick reconnect in background and return immediately.
-      // (Old code awaited connectModbus inline — up to a 5 s timeout
-      // blocking every disconnected request.)
-      _kickReconnect();
-
-      const target = currentDeviceConfig
-        ? `${currentDeviceConfig.name || 'device'} (${currentDeviceConfig.ip}:${currentDeviceConfig.port || 502})`
-        : `default device (port 502)`;
-
+    if (!isConnected(target)) {
+      // Not connected to THIS device. Its hub (if any) auto-reconnects on its
+      // own timer, so just report unavailable — no global reconnect here.
       return res.status(503).json({
         error: 'Modbus device unavailable',
-        detail: `No active connection to ${target}. Verify device power/network and TCP port 502.`,
+        detail: 'No active connection to this device. Verify device power/network and TCP port 502, then reconnect.',
         code: 'MODBUS_UNAVAILABLE'
       });
     }
 
     // Hot path: only the Modbus read is awaited.
-    const f = await readFuel();
+    const f = await readFuel(target);
     if (f === null || f === undefined) {
       return res.status(502).json({
         error: 'Fuel read failed',
@@ -587,9 +577,7 @@ app.get('/api/modbus/fuel', authenticate, requirePermission('fuel.read'), async 
 
     // Pull the most recent alarm/consumption snapshot computed by the
     // previous background pass so the response shape stays identical.
-    // First call after connect will have no snapshot → empty arrays/null,
-    // matching the old behaviour when no alarms were triggered.
-    const snap = currentDeviceId ? _lastAlarmInfo.get(currentDeviceId) : null;
+    const snap = target.deviceId ? _lastAlarmInfo.get(target.deviceId) : null;
 
     res.json({
       fuel: f,
@@ -599,9 +587,61 @@ app.get('/api/modbus/fuel', authenticate, requirePermission('fuel.read'), async 
     });
 
     // Fire-and-forget: persist + alarm check happen after response is sent.
-    if (currentDeviceId) {
-      _backgroundFuelWork(currentDeviceId, f);
+    if (target.deviceId) {
+      _backgroundFuelWork(target.deviceId, f);
     }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GPS position ────────────────────────────────────────────────────────────
+// Persist a live GPS reading onto the device row so the Dashboard map can show
+// the device even when it later goes offline.
+async function persistDeviceGps(deviceId, gps) {
+  if (!deviceId || !gps || !gps.valid || !gps.hasFix) return;
+  try {
+    await execute(
+      `UPDATE MODBUS_ADMIN.devices
+          SET latitude = :lat, longitude = :lon, altitude = :alt, gps_updated_at = :ts
+        WHERE device_id = :id`,
+      { lat: gps.latitude, lon: gps.longitude, alt: gps.altitude, ts: new Date(), id: parseInt(deviceId) }
+    );
+    console.log(`[GPS] Stored ${gps.latitude},${gps.longitude} for device ${deviceId}`);
+  } catch (e) {
+    console.warn(`[GPS] persist failed for device ${deviceId}:`, e.message);
+  }
+}
+
+// Fire-and-forget live GPS read used right after a device connects.
+function backgroundGpsRead(deviceId) {
+  if (!deviceId) return;
+  (async () => {
+    try {
+      const gps = await readGps({ deviceId });
+      if (gps) await persistDeviceGps(deviceId, gps);
+    } catch (e) {
+      console.warn(`[GPS] background read error for device ${deviceId}:`, e.message);
+    }
+  })();
+}
+
+// GET /api/modbus/gps — read the live GPS position of a connected device,
+// store it, and return it. Mirrors the /fuel endpoint's target handling.
+app.get('/api/modbus/gps', authenticate, requirePermission('device.read'), async (req, res) => {
+  const target = targetFromReq(req);
+  if (!isConnected(target)) {
+    return res.status(503).json({
+      error: 'Modbus device unavailable',
+      detail: 'No active connection to this device. Connect it to read GPS.',
+      code: 'MODBUS_UNAVAILABLE',
+    });
+  }
+  try {
+    const gps = await readGps(target);
+    if (!gps) return res.status(502).json({ error: 'GPS read failed', code: 'MODBUS_READ_FAILED' });
+    if (target.deviceId) await persistDeviceGps(target.deviceId, gps);
+    res.json(gps);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -670,52 +710,32 @@ app.get('/api/alarms', authenticate, requirePermission('alarm.read'), async (req
 // ============================================================================
 app.get('/api/projects', authenticate, async (req, res) => {
   try {
-    const userId = req.user.id;
+    // A user sees a project when they have ANY grant that reaches it — global,
+    // a project grant, or a location/device grant whose project resolves to it.
+    // This lets a device/location-scoped user reach the project that contains
+    // their scope (read-only navigation).
+    const { global, ids } = await visibleProjects(req.user.id);
 
-    // Check if user has GLOBAL project.read (any role with no project_id)
-    const globalRes = await query(
-      `SELECT 1
-         FROM MODBUS_ADMIN.user_roles       ur
-         JOIN MODBUS_ADMIN.role_permissions rp ON rp.role_id      = ur.role_id
-         JOIN MODBUS_ADMIN.permissions      p  ON p.permission_id = rp.permission_id
-         JOIN MODBUS_ADMIN.users            u  ON u.user_id       = ur.user_id
-        WHERE u.status         = 'active'
-          AND ur.user_id       = :userId
-          AND p.permission_key = 'project.read'
-          AND ur.project_id    IS NULL
-          AND ROWNUM = 1`,
-      { userId }
-    );
-    const hasGlobal = globalRes.length > 0;
-
-    let sql;
-    let binds = {};
-
-    if (hasGlobal) {
-      // Admin / global viewer: see every project
-      sql = `SELECT ID, NAME, DESCRIPTION, CREATED_AT, UPDATED_AT
-               FROM MODBUS_ADMIN.projects ORDER BY ID`;
-    } else {
-      // Scoped-only access: only projects explicitly granted via user_roles
-      sql = `SELECT ID, NAME, DESCRIPTION, CREATED_AT, UPDATED_AT
-               FROM MODBUS_ADMIN.projects
-              WHERE ID IN (
-                    SELECT DISTINCT ur.project_id
-                      FROM MODBUS_ADMIN.user_roles       ur
-                      JOIN MODBUS_ADMIN.role_permissions rp ON rp.role_id      = ur.role_id
-                      JOIN MODBUS_ADMIN.permissions      p  ON p.permission_id = rp.permission_id
-                      JOIN MODBUS_ADMIN.users            u  ON u.user_id       = ur.user_id
-                     WHERE u.status         = 'active'
-                       AND ur.user_id       = :userId
-                       AND p.permission_key = 'project.read'
-                       AND ur.project_id    IS NOT NULL
-                  )
-              ORDER BY ID`;
-      binds = { userId };
+    if (global) {
+      const rows = await query(
+        `SELECT ID, NAME, DESCRIPTION, CREATED_AT, UPDATED_AT
+           FROM MODBUS_ADMIN.projects ORDER BY ID`);
+      return res.json(rows);
     }
 
-    const result = await query(sql, binds);
-    res.json(result);
+    if (!ids || ids.size === 0) return res.json([]);
+
+    const arr = [...ids];
+    const names = arr.map((_, i) => `:p${i}`);
+    const binds = {};
+    arr.forEach((v, i) => { binds[`p${i}`] = v; });
+
+    const rows = await query(
+      `SELECT ID, NAME, DESCRIPTION, CREATED_AT, UPDATED_AT
+         FROM MODBUS_ADMIN.projects
+        WHERE ID IN (${names.join(', ')})
+        ORDER BY ID`, binds);
+    res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -805,7 +825,7 @@ app.delete('/api/projects/:id', authenticate, requirePermission('project.write')
 
 
 // List locations for project
-app.get('/api/projects/:projectId/locations', authenticate, requirePermission('project.read'), async (req, res) => {
+app.get('/api/projects/:projectId/locations', authenticate, async (req, res) => {
   const projectId = parseInt(req.params.projectId);
   if (!Number.isInteger(projectId) || projectId <= 0) return res.status(400).json({ error: 'Invalid project ID' });
   try {
@@ -889,7 +909,16 @@ app.get('/api/projects/:projectId/locations', authenticate, requirePermission('p
       });
     };
     
-    const tree = buildTree(items);
+    // Scope filter: a device/location-scoped user only sees the path to (and
+    // subtree of) their grant. null => full project visible; empty Set => the
+    // user has no grant reaching this project.
+    const visible = await visibleLocationIds(req.user.id, projectId, items);
+    if (visible && visible.size === 0) {
+      return res.status(403).json({ error: 'Forbidden: no access to this project', code: 'AUTH_FORBIDDEN' });
+    }
+    const scopedItems = visible ? items.filter(it => visible.has(it.ID)) : items;
+
+    const tree = buildTree(scopedItems);
     console.log('Tree built, count:', tree.length);
     res.json(tree);
   } catch (e) {
@@ -901,7 +930,7 @@ app.get('/api/projects/:projectId/locations', authenticate, requirePermission('p
 // ============================================================================
 // LOCATIONS API
 // ============================================================================
-app.post('/api/projects/:projectId/locations', authenticate, requirePermission('project.write'), async (req, res) => {
+app.post('/api/projects/:projectId/locations', authenticate, requireAnyPermission(['project.write', 'location.write']), async (req, res) => {
   const projectId = parseInt(req.params.projectId);
   if (!Number.isInteger(projectId) || projectId <= 0) return res.status(400).json({ error: 'Invalid project ID' });
   const { name, description, address, parent_id } = req.body;
@@ -936,7 +965,7 @@ app.post('/api/projects/:projectId/locations', authenticate, requirePermission('
   }
 });
 
-app.get('/api/locations/:id', authenticate, requirePermission('project.read'), async (req, res) => {
+app.get('/api/locations/:id', authenticate, requireAnyPermission(['project.read', 'location.read']), async (req, res) => {
   const id = parseInt(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid location ID' });
   try {
@@ -951,7 +980,7 @@ app.get('/api/locations/:id', authenticate, requirePermission('project.read'), a
   }
 });
 
-app.put('/api/locations/:id', authenticate, requirePermission('project.write'), async (req, res) => {
+app.put('/api/locations/:id', authenticate, requireAnyPermission(['project.write', 'location.write']), async (req, res) => {
   const id = parseInt(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid location ID' });
   const { name, description, address, parent_id } = req.body;
@@ -989,7 +1018,7 @@ app.put('/api/locations/:id', authenticate, requirePermission('project.write'), 
   }
 });
 
-app.delete('/api/locations/:id', authenticate, requirePermission('project.write'), async (req, res) => {
+app.delete('/api/locations/:id', authenticate, requireAnyPermission(['project.write', 'location.write']), async (req, res) => {
   const id = parseInt(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid location ID' });
   try {
@@ -1010,7 +1039,7 @@ app.get('/api/locations/:locationId/devices', authenticate, requirePermission('d
   if (!Number.isInteger(locationId) || locationId <= 0) return res.status(400).json({ error: 'Invalid location ID' });
   try {
     const rows = await query(
-      'SELECT device_id as id, device_name as name, device_ip as ip, device_port as port, status, location_id FROM MODBUS_ADMIN.devices WHERE location_id = :locationId ORDER BY device_name',
+      'SELECT device_id as id, device_name as name, device_ip as ip, device_port as port, status, location_id, latitude, longitude, altitude FROM MODBUS_ADMIN.devices WHERE location_id = :locationId ORDER BY device_name',
       [locationId]
     );
     res.json(rows);
@@ -1020,7 +1049,7 @@ app.get('/api/locations/:locationId/devices', authenticate, requirePermission('d
 });
 
 // GET sub-locations
-app.get('/api/locations/:id/children', authenticate, requirePermission('project.read'), async (req, res) => {
+app.get('/api/locations/:id/children', authenticate, requireAnyPermission(['project.read', 'location.read']), async (req, res) => {
   const id = parseInt(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid location ID' });
   try {
@@ -1045,9 +1074,9 @@ app.get('/api/project-tree', authenticate, requirePermission('project.read'), as
 });
 
 // Update /api/devices to support filters and location_id
-app.get('/api/devices', authenticate, requirePermission('device.read'), async (req, res) => {
+app.get('/api/devices', authenticate, async (req, res) => {
   const { location_id, project_id, status } = req.query;
-  let sql = 'SELECT device_id as id, device_name as name, device_ip as ip, device_port as port, status, location_id FROM MODBUS_ADMIN.devices';
+  let sql = 'SELECT device_id as id, device_name as name, device_ip as ip, device_port as port, status, location_id, latitude, longitude, altitude FROM MODBUS_ADMIN.devices';
   const binds = [];
   const conditions = [];
   if (location_id) {
@@ -1068,7 +1097,10 @@ app.get('/api/devices', authenticate, requirePermission('device.read'), async (r
   sql += ' ORDER BY device_name';
   try {
     const rows = await query(sql, binds);
-    res.json(rows);
+    // Scope filter: return only devices the user can see (global sees all;
+    // otherwise their granted devices + devices in projects/locations they hold).
+    const visibleRows = await filterVisibleDevices(req.user.id, rows);
+    res.json(visibleRows);
   } catch (e) {
     console.error('GET /api/devices error:', e.message);
     res.status(500).json({ error: e.message });
@@ -1077,7 +1109,7 @@ app.get('/api/devices', authenticate, requirePermission('device.read'), async (r
 
 // Update POST /api/devices to support location_id
 app.post('/api/devices', authenticate, requirePermission('device.write'), async (req, res) => {
-  const { id, name, ip, port, status, location_id } = req.body;
+  const { id, name, ip, port, status, location_id, latitude, longitude } = req.body;
   console.log('POST devices body:', req.body);
   try {
     let device_id = parseInt(id);
@@ -1086,16 +1118,29 @@ app.post('/api/devices', authenticate, requirePermission('device.write'), async 
       device_id = result[0].NEXT_ID;
     }
     const columns = ['device_id', 'device_name', 'device_ip', 'device_port', 'status'];
-    const bindsObj = { 
-      device_id, 
-      device_name: name, 
-      device_ip: ip, 
-      device_port: parseInt(port) || 502, 
-      status: status || 'online' 
+    const bindsObj = {
+      device_id,
+      device_name: name,
+      device_ip: ip,
+      device_port: parseInt(port) || 502,
+      status: status || 'online'
     };
     if (location_id) {
       columns.push('location_id');
       bindsObj.location_id = parseInt(location_id);
+    }
+    // Optional manual GPS coordinates (also auto-filled from Modbus when connected)
+    if (latitude !== undefined && latitude !== null && latitude !== '' && !isNaN(parseFloat(latitude))) {
+      columns.push('latitude');
+      bindsObj.latitude = parseFloat(latitude);
+    }
+    if (longitude !== undefined && longitude !== null && longitude !== '' && !isNaN(parseFloat(longitude))) {
+      columns.push('longitude');
+      bindsObj.longitude = parseFloat(longitude);
+    }
+    if (bindsObj.latitude !== undefined || bindsObj.longitude !== undefined) {
+      columns.push('gps_updated_at');
+      bindsObj.gps_updated_at = new Date(); // oracledb binds JS Date to TIMESTAMP
     }
     const placeholders = columns.map(c => ':' + c).join(', ');
     const values = columns.map(c => `:${c}`).join(', ');
@@ -1103,7 +1148,7 @@ app.post('/api/devices', authenticate, requirePermission('device.write'), async 
       `INSERT INTO MODBUS_ADMIN.DEVICES (${columns.join(', ')}) VALUES (${values})`,
       bindsObj
     );
-    res.json({ success: true, device: { id: device_id, name, ip, port: parseInt(port), status: status || 'online', location_id } });
+    res.json({ success: true, device: { id: device_id, name, ip, port: parseInt(port), status: status || 'online', location_id, latitude: bindsObj.latitude ?? null, longitude: bindsObj.longitude ?? null } });
   } catch (e) {
     console.error('POST /api/devices error:', req.body, e.message);
     res.status(500).json({ error: e.message });
@@ -1111,14 +1156,28 @@ app.post('/api/devices', authenticate, requirePermission('device.write'), async 
 });
 
 // Update PUT /api/devices/:id to support location_id
-app.put('/api/devices/:id', authenticate, requirePermission('device.write'), async (req, res) => {
-  const deviceId = parseInt(req.params.id);
-  const { name, ip, port, status, location_id } = req.body;
+app.put('/api/devices/:deviceId', authenticate, requirePermission('device.write'), async (req, res) => {
+  const deviceId = parseInt(req.params.deviceId);
+  const { name, ip, port, status, location_id, latitude, longitude } = req.body;
   const updates = ['device_name = :name', 'device_ip = :ip', 'device_port = :port', 'status = :status'];
   const bindsObj = { name, ip, port: parseInt(port), status, id: deviceId };
   if (location_id !== undefined) {
     updates.push('location_id = :location_id');
     bindsObj.location_id = location_id ? parseInt(location_id) : null;
+  }
+  // Manual GPS coordinate edits. Empty string clears the coordinate.
+  if (latitude !== undefined) {
+    updates.push('latitude = :latitude', 'gps_updated_at = :gps_updated_at');
+    bindsObj.latitude = (latitude === '' || latitude === null) ? null : parseFloat(latitude);
+    bindsObj.gps_updated_at = new Date();
+  }
+  if (longitude !== undefined) {
+    updates.push('longitude = :longitude');
+    bindsObj.longitude = (longitude === '' || longitude === null) ? null : parseFloat(longitude);
+    if (bindsObj.gps_updated_at === undefined) {
+      updates.push('gps_updated_at = :gps_updated_at');
+      bindsObj.gps_updated_at = new Date();
+    }
   }
   const setClause = updates.join(', ');
   try {
@@ -1430,6 +1489,7 @@ app.put('/api/settings', authenticate, requirePermission('settings.write'), asyn
   async function shutdown(signal) {
     console.log(`\n[Shutdown] ${signal} received — closing gracefully…`);
     server.close(async () => {
+      await closeAll().catch(() => {});   // close every Modbus device hub
       await closePool();
       console.log('[Shutdown] Done.');
       process.exit(0);

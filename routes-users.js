@@ -30,7 +30,7 @@ const oracledb = require('oracledb');
 const router = express.Router();
 
 const { hashPassword, invalidateUserPermsCache, revokeAllSessions } = require('./auth');
-const { authenticate, requirePermission } = require('./middleware');
+const { authenticate, requirePermission, invalidateEndpointCache } = require('./middleware');
 const { getConnection } = require('./db');
 const { query, execute } = require('./db-helpers');
 
@@ -138,11 +138,13 @@ router.post('/users', requirePermission('user.write'), async (req, res) => {
     );
     const newId = insRes.outBinds.outId[0];
 
-    // Grant a role: provided roleKey, otherwise default to 'viewer'
+    // Grant a role: provided roleKey, otherwise default to 'viewer'. The
+    // role's own scope/level is copied in — the admin doesn't pick one.
     const targetRoleKey = roleKey || 'viewer';
     await conn.execute(
-      `INSERT INTO MODBUS_ADMIN.user_roles (user_id, role_id, project_id, granted_by)
-       SELECT :newUserId, r.role_id, NULL, :grantedBy
+      `INSERT INTO MODBUS_ADMIN.user_roles
+         (user_id, role_id, project_id, location_id, device_id, granted_by)
+       SELECT :newUserId, r.role_id, r.scope_project_id, r.scope_location_id, r.scope_device_id, :grantedBy
          FROM MODBUS_ADMIN.roles r
         WHERE r.role_key = :rk`,
       { newUserId: newId, grantedBy: req.user.id, rk: targetRoleKey }
@@ -287,32 +289,47 @@ router.post('/users/:id/roles', requirePermission('user.assign_role'), async (re
   const { roleKey, projectId, locationId, deviceId } = req.body || {};
   if (!roleKey) return res.status(400).json({ error: 'roleKey is required' });
 
-  // A grant is scoped to at most ONE level: global, project, location, or
-  // device. Mixing levels is ambiguous, so reject it up front.
-  const scopes = [projectId, locationId, deviceId].filter(v => v !== undefined && v !== null && v !== '');
-  if (scopes.length > 1) {
+  // The role provides the DEFAULT level/target, but the same role can be given
+  // to different users on different targets. So: if the caller supplies a
+  // specific target (projectId | locationId | deviceId) we use it; otherwise we
+  // fall back to whatever the role has stored. A grant is scoped to at most one
+  // level, so reject a mix.
+  const provided = [projectId, locationId, deviceId].filter(v => v !== undefined && v !== null && v !== '');
+  if (provided.length > 1) {
     return res.status(400).json({ error: 'Provide only one of projectId, locationId, or deviceId' });
   }
+  const overrideGiven = provided.length === 1;
 
   const conn = await getConnection();
   if (!conn) return res.status(503).json({ error: 'DB unavailable' });
   try {
     const roleRes = await conn.execute(
-      `SELECT role_id FROM MODBUS_ADMIN.roles WHERE role_key = :k`,
-      { k: roleKey }
+      `SELECT role_id, scope_project_id, scope_location_id, scope_device_id
+         FROM MODBUS_ADMIN.roles WHERE role_key = :rk`,
+      { rk: roleKey }
     );
     if (!roleRes.rows?.length) return res.status(404).json({ error: 'Unknown roleKey' });
-    const roleId = roleRes.rows[0][0];
+    const [roleId, roleProj, roleLoc, roleDev] = roleRes.rows[0];
+
+    // Effective scope: caller's override if given, else the role's own scope.
+    const eff = overrideGiven
+      ? {
+          projectId:  projectId  ? Number(projectId)  : null,
+          locationId: locationId ? Number(locationId) : null,
+          deviceId:   deviceId   ? Number(deviceId)   : null,
+        }
+      : { projectId: roleProj, locationId: roleLoc, deviceId: roleDev };
 
     await conn.execute(
-      `INSERT INTO MODBUS_ADMIN.user_roles (user_id, role_id, project_id, location_id, device_id, granted_by)
+      `INSERT INTO MODBUS_ADMIN.user_roles
+         (user_id, role_id, project_id, location_id, device_id, granted_by)
        VALUES (:userId, :rid, :projectId, :locationId, :deviceId, :grantedBy)`,
       {
         userId: id,
         rid: roleId,
-        projectId:  projectId  || null,
-        locationId: locationId || null,
-        deviceId:   deviceId   || null,
+        projectId:  eff.projectId,
+        locationId: eff.locationId,
+        deviceId:   eff.deviceId,
         grantedBy: req.user.id,
       },
       { autoCommit: true }
@@ -354,11 +371,23 @@ router.delete('/users/:id/roles/:userRoleId', requirePermission('user.assign_rol
 });
 
 // ── GET /api/roles ────────────────────────────────────────────────────────
+// Each role now carries its own scope "level" (global/project/location/device)
+// plus the target it points at. We resolve the target's name so the UI can
+// show e.g. "Device: Pump-3" instead of a bare id.
 router.get('/roles', requirePermission('user.read'), async (_req, res) => {
   try {
     const rows = await query(
-      `SELECT role_id, role_key, role_name, description, is_system
-         FROM MODBUS_ADMIN.roles ORDER BY role_key`
+      `SELECT r.role_id, r.role_key, r.role_name, r.description, r.is_system,
+              r.scope_level, r.scope_project_id, r.scope_location_id, r.scope_device_id,
+              r.scope_count,
+              p.name  AS project_name,
+              l.name  AS location_name,
+              d.device_name AS device_name
+         FROM MODBUS_ADMIN.roles r
+         LEFT JOIN MODBUS_ADMIN.projects  p ON p.id        = r.scope_project_id
+         LEFT JOIN MODBUS_ADMIN.locations l ON l.id        = r.scope_location_id
+         LEFT JOIN MODBUS_ADMIN.devices   d ON d.device_id = r.scope_device_id
+        ORDER BY r.role_key`
     );
     res.json(rows.map(r => ({
       id:          r.ROLE_ID,
@@ -366,24 +395,391 @@ router.get('/roles', requirePermission('user.read'), async (_req, res) => {
       name:        r.ROLE_NAME,
       description: r.DESCRIPTION,
       isSystem:    r.IS_SYSTEM === 1,
+      scopeLevel:      r.SCOPE_LEVEL || 'global',
+      scopeProjectId:  r.SCOPE_PROJECT_ID,
+      scopeLocationId: r.SCOPE_LOCATION_ID,
+      scopeDeviceId:   r.SCOPE_DEVICE_ID,
+      scopeCount:      r.SCOPE_COUNT ?? null,
+      scopeTargetName: r.PROJECT_NAME || r.LOCATION_NAME || r.DEVICE_NAME || null,
     })));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
+// Built-in permission keys — referenced directly in backend route guards and
+// frontend gates. They can be re-described but NOT renamed or deleted from the
+// UI, since removing them would silently break access checks.
+const BUILTIN_PERMISSION_KEYS = new Set([
+  'device.read', 'device.write', 'device.connect', 'device.control',
+  'device.start', 'device.stop',
+  'fuel.read', 'alarm.read',
+  'project.read', 'project.write',
+  'location.read', 'location.write',
+  'settings.read', 'settings.write',
+  'user.read', 'user.write', 'user.assign_role',
+  'audit.read',
+]);
+
 // ── GET /api/permissions ──────────────────────────────────────────────────
 router.get('/permissions', requirePermission('user.read'), async (_req, res) => {
   try {
     const rows = await query(
-      `SELECT permission_id, permission_key, description
+      `SELECT permission_id, permission_key, description, resource_type, access_level
          FROM MODBUS_ADMIN.permissions ORDER BY permission_key`
     );
     res.json(rows.map(r => ({
       id:          r.PERMISSION_ID,
       key:         r.PERMISSION_KEY,
       description: r.DESCRIPTION,
+      resource:    r.RESOURCE_TYPE || null,
+      action:      r.ACCESS_LEVEL || null,
+      isBuiltin:   BUILTIN_PERMISSION_KEYS.has(r.PERMISSION_KEY),
     })));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /api/permissions ── create a new permission key ──────────────────
+router.post('/permissions', requirePermission('user.assign_role'), async (req, res) => {
+  const key = String(req.body?.permissionKey || '').trim();
+  const description = req.body?.description != null ? String(req.body.description).trim() : null;
+  // Keys follow '<resource>.<action>' — lowercase letters, digits, dot, underscore.
+  if (!/^[a-z][a-z0-9_]*\.[a-z0-9_]+$/.test(key)) {
+    return res.status(400).json({ error: "permissionKey must look like 'resource.action' (lowercase, e.g. report.export)" });
+  }
+  if (key.length > 80) return res.status(400).json({ error: 'permissionKey too long (max 80)' });
+  // Derive resource/action from the key ('report.export' → report / export).
+  const dot = key.indexOf('.');
+  const resource = dot > 0 ? key.slice(0, dot) : null;
+  const action = dot > 0 ? key.slice(dot + 1) : null;
+  try {
+    const r = await execute(
+      `INSERT INTO MODBUS_ADMIN.permissions (permission_key, description, resource_type, access_level)
+       VALUES (:k, :d, :r, :a)`,
+      { k: key, d: description, r: resource, a: action }
+    );
+    res.status(201).json({ success: true, rowsAffected: r.rowsAffected || 0 });
+  } catch (e) {
+    if (/UQ_PERMISSIONS_KEY|unique constraint/i.test(e.message)) {
+      return res.status(409).json({ error: 'A permission with that key already exists' });
+    }
+    console.error('POST /api/permissions error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── PUT /api/permissions/:id ── edit description / resource / action ──────
+router.put('/permissions/:id', requirePermission('user.assign_role'), async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid permission id' });
+
+  const sets = [];
+  const binds = { id };
+  const clean = (v) => (v == null ? null : String(v).trim() || null);
+  if (req.body?.description !== undefined) { sets.push('description = :d');   binds.d = clean(req.body.description); }
+  if (req.body?.resource    !== undefined) { sets.push('resource_type = :r'); binds.r = clean(req.body.resource); }
+  if (req.body?.action      !== undefined) { sets.push('access_level = :a');  binds.a = clean(req.body.action); }
+  if (sets.length === 0) return res.status(400).json({ error: 'nothing to update' });
+
+  try {
+    const r = await execute(
+      `UPDATE MODBUS_ADMIN.permissions SET ${sets.join(', ')} WHERE permission_id = :id`,
+      binds
+    );
+    if ((r.rowsAffected || 0) === 0) return res.status(404).json({ error: 'Permission not found' });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /api/permissions/:id/endpoints ── routes this permission protects ──
+router.get('/permissions/:id/endpoints', requirePermission('user.read'), async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid permission id' });
+  try {
+    const rows = await query(
+      `SELECT e.endpoint_id, e.http_method, e.path_pattern
+         FROM MODBUS_ADMIN.permission_endpoints e
+         JOIN MODBUS_ADMIN.permissions p ON p.permission_key = e.permission_key
+        WHERE p.permission_id = :id
+        ORDER BY e.path_pattern`,
+      { id }
+    );
+    res.json(rows.map(r => ({
+      id:         r.ENDPOINT_ID,
+      httpMethod: r.HTTP_METHOD,
+      pathPattern: r.PATH_PATTERN,
+    })));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /api/permissions/:id/endpoints ── protect a route with it ─────────
+router.post('/permissions/:id/endpoints', requirePermission('user.assign_role'), async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid permission id' });
+  const method = String(req.body?.httpMethod || 'ANY').toUpperCase();
+  const pathPattern = String(req.body?.pathPattern || '').trim();
+  if (!['ANY', 'GET', 'POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) {
+    return res.status(400).json({ error: 'httpMethod must be ANY/GET/POST/PUT/DELETE/PATCH' });
+  }
+  if (!/^\/[A-Za-z0-9_\-/:.]+$/.test(pathPattern)) {
+    return res.status(400).json({ error: "pathPattern must be a path like /api/reports or /api/locations/:id" });
+  }
+  try {
+    const keyRows = await query(
+      `SELECT permission_key FROM MODBUS_ADMIN.permissions WHERE permission_id = :id`,
+      { id }
+    );
+    if (!keyRows.length) return res.status(404).json({ error: 'Permission not found' });
+    await execute(
+      `INSERT INTO MODBUS_ADMIN.permission_endpoints (permission_key, http_method, path_pattern)
+       VALUES (:k, :m, :p)`,
+      { k: keyRows[0].PERMISSION_KEY, m: method, p: pathPattern }
+    );
+    invalidateEndpointCache();
+    res.status(201).json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── DELETE /api/permission-endpoints/:endpointId ── stop protecting a route ─
+router.delete('/permission-endpoints/:endpointId', requirePermission('user.assign_role'), async (req, res) => {
+  const eid = parseInt(req.params.endpointId);
+  if (!Number.isInteger(eid) || eid <= 0) return res.status(400).json({ error: 'Invalid endpoint id' });
+  try {
+    const r = await execute(
+      `DELETE FROM MODBUS_ADMIN.permission_endpoints WHERE endpoint_id = :eid`,
+      { eid }
+    );
+    if ((r.rowsAffected || 0) === 0) return res.status(404).json({ error: 'Endpoint mapping not found' });
+    invalidateEndpointCache();
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Permission → UI element mappings ──────────────────────────────────────
+// Which granular UI elements (buttons/controls — see the frontend catalog in
+// config/uiElements.js) a permission covers. Many-to-many: an element may be
+// listed under several permissions. Whether a covered element is usable vs
+// view-only is decided on the client by the permission's OWN access level
+// (read = view only, anything else = usable).
+
+// GET /api/ui-elements — every mapping (element_id + the permission covering
+// it). Readable by any authenticated user so the UI can gate live controls.
+router.get('/ui-elements', async (_req, res) => {
+  try {
+    const rows = await query(
+      `SELECT element_id, permission_key FROM MODBUS_ADMIN.permission_ui_elements`
+    );
+    res.json(rows.map(r => ({
+      elementId: r.ELEMENT_ID,
+      permissionKey: r.PERMISSION_KEY,
+    })));
+  } catch (e) {
+    // If the table doesn't exist yet, behave as "no mappings".
+    if (/ORA-00942/i.test(e.message)) return res.json([]);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── UI element catalog ─────────────────────────────────────────────────────
+// The master list of granular UI elements (buttons/controls), grouped by field.
+// Seeded by SQL-ui-element-catalog.sql; editable so typed-in elements persist.
+
+// GET /api/ui-element-catalog — the full catalog, ordered for display. Readable
+// by any authenticated user so the Permissions editor can render it.
+router.get('/ui-element-catalog', async (_req, res) => {
+  try {
+    const rows = await query(
+      `SELECT element_id, field, label
+         FROM MODBUS_ADMIN.ui_element_catalog
+        ORDER BY sort_order, field, element_id`
+    );
+    res.json(rows.map(r => ({ id: r.ELEMENT_ID, field: r.FIELD, label: r.LABEL })));
+  } catch (e) {
+    if (/ORA-00942/i.test(e.message)) return res.json([]); // table not created yet
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/ui-element-catalog { id, field?, label? } — add or update a catalog
+// element (used to persist a typed-in element so it becomes a reusable checkbox).
+router.post('/ui-element-catalog', requirePermission('user.assign_role'), async (req, res) => {
+  const id = String(req.body?.id || '').trim();
+  if (!id || id.length > 60 || !/^[a-z][a-z0-9_.]*$/i.test(id)) {
+    return res.status(400).json({ error: 'Invalid element id' });
+  }
+  const field = (String(req.body?.field || '').trim() || id.split('.')[0] || 'other').slice(0, 40);
+  const label = (String(req.body?.label || '').trim() || id).slice(0, 200);
+  try {
+    await execute(
+      `MERGE INTO MODBUS_ADMIN.ui_element_catalog t
+         USING (SELECT :id AS element_id FROM dual) s
+         ON (t.element_id = s.element_id)
+       WHEN MATCHED THEN UPDATE SET field = :field, label = :label
+       WHEN NOT MATCHED THEN
+         INSERT (element_id, field, label, sort_order) VALUES (:id, :field, :label, 999)`,
+      { id, field, label }
+    );
+    res.status(201).json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/permissions/:id/elements — element ids this permission covers.
+router.get('/permissions/:id/elements', requirePermission('user.read'), async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid permission id' });
+  try {
+    const rows = await query(
+      `SELECT m.element_id
+         FROM MODBUS_ADMIN.permission_ui_elements m
+         JOIN MODBUS_ADMIN.permissions p ON p.permission_key = m.permission_key
+        WHERE p.permission_id = :id
+        ORDER BY m.element_id`,
+      { id }
+    );
+    res.json(rows.map(r => r.ELEMENT_ID));
+  } catch (e) {
+    if (/ORA-00942/i.test(e.message)) return res.json([]);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/permissions/:id/elements { elementId } — cover an element.
+router.post('/permissions/:id/elements', requirePermission('user.assign_role'), async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid permission id' });
+  const elementId = String(req.body?.elementId || '').trim();
+  if (!elementId || elementId.length > 60 || !/^[a-z][a-z0-9_.]*$/i.test(elementId)) {
+    return res.status(400).json({ error: 'Invalid elementId' });
+  }
+  try {
+    const keyRows = await query(
+      `SELECT permission_key FROM MODBUS_ADMIN.permissions WHERE permission_id = :id`,
+      { id }
+    );
+    if (!keyRows.length) return res.status(404).json({ error: 'Permission not found' });
+    await execute(
+      `MERGE INTO MODBUS_ADMIN.permission_ui_elements t
+         USING (SELECT :k AS permission_key, :e AS element_id FROM dual) s
+         ON (t.permission_key = s.permission_key AND t.element_id = s.element_id)
+       WHEN NOT MATCHED THEN
+         INSERT (permission_key, element_id) VALUES (s.permission_key, s.element_id)`,
+      { k: keyRows[0].PERMISSION_KEY, e: elementId }
+    );
+    res.status(201).json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/permissions/:id/elements/:elementId — stop covering an element.
+router.delete('/permissions/:id/elements/:elementId', requirePermission('user.assign_role'), async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid permission id' });
+  const elementId = String(req.params.elementId || '').trim();
+  try {
+    const r = await execute(
+      `DELETE FROM MODBUS_ADMIN.permission_ui_elements
+        WHERE element_id = :e
+          AND permission_key = (
+            SELECT permission_key FROM MODBUS_ADMIN.permissions WHERE permission_id = :id
+          )`,
+      { e: elementId, id }
+    );
+    if ((r.rowsAffected || 0) === 0) return res.status(404).json({ error: 'Element mapping not found' });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── DELETE /api/permissions/:id ── remove a custom permission ─────────────
+router.delete('/permissions/:id', requirePermission('user.assign_role'), async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid permission id' });
+  try {
+    // Look up the key so we can protect built-ins.
+    const rows = await query(
+      `SELECT permission_key FROM MODBUS_ADMIN.permissions WHERE permission_id = :id`,
+      { id }
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Permission not found' });
+    if (BUILTIN_PERMISSION_KEYS.has(rows[0].PERMISSION_KEY)) {
+      return res.status(400).json({ error: 'Built-in permissions cannot be deleted' });
+    }
+    // role_permissions rows cascade automatically (ON DELETE CASCADE).
+    await execute(`DELETE FROM MODBUS_ADMIN.permissions WHERE permission_id = :id`, { id });
+    invalidateUserPermsCache();
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── UI feature → permission overrides ─────────────────────────────────────
+// Which permission reveals a UI feature (nav link, button, page). A row with a
+// NULL permission_key means "always visible"; no row means "use the frontend's
+// built-in default". Readable by any authenticated user (the UI needs it to
+// render); editable only with user.assign_role.
+
+// GET /api/ui-features — list overrides
+router.get('/ui-features', async (_req, res) => {
+  try {
+    const rows = await query(
+      `SELECT feature_id, permission_key FROM MODBUS_ADMIN.ui_feature_permissions`
+    );
+    res.json(rows.map(r => ({
+      featureId: r.FEATURE_ID,
+      permissionKey: r.PERMISSION_KEY || null,
+    })));
+  } catch (e) {
+    // If the table doesn't exist yet, behave as "no overrides".
+    if (/ORA-00942/i.test(e.message)) return res.json([]);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/ui-features/:featureId — set the controlling permission (or null)
+router.put('/ui-features/:featureId', requirePermission('user.assign_role'), async (req, res) => {
+  const featureId = String(req.params.featureId || '').trim();
+  if (!featureId || featureId.length > 60) return res.status(400).json({ error: 'Invalid featureId' });
+  const permissionKey = req.body?.permissionKey ? String(req.body.permissionKey).trim() : null;
+  try {
+    await execute(
+      `MERGE INTO MODBUS_ADMIN.ui_feature_permissions t
+         USING (SELECT :fid AS feature_id FROM dual) s
+         ON (t.feature_id = s.feature_id)
+       WHEN MATCHED THEN UPDATE SET t.permission_key = :pk
+       WHEN NOT MATCHED THEN INSERT (feature_id, permission_key) VALUES (:fid, :pk)`,
+      { fid: featureId, pk: permissionKey }
+    );
+    res.json({ success: true });
+  } catch (e) {
+    if (/ORA-02291/i.test(e.message)) return res.status(400).json({ error: 'Unknown permission key' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/ui-features/:featureId — reset to the built-in default
+router.delete('/ui-features/:featureId', requirePermission('user.assign_role'), async (req, res) => {
+  const featureId = String(req.params.featureId || '').trim();
+  try {
+    await execute(
+      `DELETE FROM MODBUS_ADMIN.ui_feature_permissions WHERE feature_id = :fid`,
+      { fid: featureId }
+    );
+    res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -468,23 +864,63 @@ router.delete('/roles/:id/permissions/:pid', requirePermission('user.assign_role
   }
 });
 
+// Normalize a role's scope from a request body. A role applies at exactly one
+// level; only the matching target id is kept, everything else is nulled.
+function normalizeScope(body = {}) {
+  const level = ['global', 'project', 'location', 'device'].includes(body.scopeLevel)
+    ? body.scopeLevel : 'global';
+  const num = (v) => (v === undefined || v === null || v === '' ? null : Number(v));
+  // The target on a role is OPTIONAL. A role can declare just its level (e.g.
+  // "project-level") and leave the specific project blank — the actual target
+  // is then chosen per user when the role is assigned. A target may still be
+  // set here to act as a default.
+  // scope_count: how many of the level's entity this role covers. A positive
+  // integer (>= 1) for scoped levels; null for global (nothing to count).
+  let count = num(body.scopeCount);
+  if (level === 'global') {
+    count = null;
+  } else if (count === null || !Number.isFinite(count) || count < 1) {
+    count = 1;
+  } else {
+    count = Math.floor(count);
+  }
+
+  return {
+    scopeLevel: level,
+    scopeProjectId:  level === 'project'  ? num(body.scopeProjectId)  : null,
+    scopeLocationId: level === 'location' ? num(body.scopeLocationId) : null,
+    scopeDeviceId:   level === 'device'   ? num(body.scopeDeviceId)   : null,
+    scopeCount: count,
+  };
+}
+
 // ── POST /api/roles ── create custom role ─────────────────────────────────
 router.post('/roles', requirePermission('user.assign_role'), async (req, res) => {
   const { roleKey, roleName, description, permissions } = req.body || {};
   if (!roleKey || roleKey.length < 2) return res.status(400).json({ error: 'roleKey (>=2 chars) required' });
   if (!roleName || roleName.length < 2) return res.status(400).json({ error: 'roleName (>=2 chars) required' });
 
+  const scope = normalizeScope(req.body);
+  if (scope.error) return res.status(400).json({ error: scope.error });
+
   const conn = await getConnection();
   if (!conn) return res.status(503).json({ error: 'DB unavailable' });
   try {
     const insRes = await conn.execute(
-      `INSERT INTO MODBUS_ADMIN.roles (role_key, role_name, description, is_system)
-       VALUES (:rk, :rn, :rd, 0)
+      `INSERT INTO MODBUS_ADMIN.roles
+         (role_key, role_name, description, is_system,
+          scope_level, scope_project_id, scope_location_id, scope_device_id, scope_count)
+       VALUES (:rk, :rn, :rd, 0, :sl, :spid, :slid, :sdid, :scnt)
        RETURNING role_id INTO :outId`,
       {
         rk: roleKey,
         rn: roleName,
         rd: description || null,
+        sl:   scope.scopeLevel,
+        spid: scope.scopeProjectId,
+        slid: scope.scopeLocationId,
+        sdid: scope.scopeDeviceId,
+        scnt: scope.scopeCount,
         outId: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER },
       }
     );
@@ -511,6 +947,7 @@ router.post('/roles', requirePermission('user.assign_role'), async (req, res) =>
     res.status(201).json({ success: true, id: newId });
   } catch (e) {
     if (/UQ_ROLES_ROLE_KEY/i.test(e.message)) return res.status(409).json({ error: 'roleKey already exists' });
+    if (/ORA-02291/i.test(e.message)) return res.status(400).json({ error: 'Invalid scope target (project/location/device not found)' });
     console.error('POST /api/roles error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
@@ -528,6 +965,23 @@ router.put('/roles/:id', requirePermission('user.assign_role'), async (req, res)
   const binds = { id };
   if (roleName !== undefined) { updates.push('role_name = :rn'); binds.rn = roleName; }
   if (description !== undefined) { updates.push('description = :rd'); binds.rd = description || null; }
+
+  // Scope/level is editable for every role (system + custom). Only touch the
+  // scope columns when a scopeLevel was supplied so callers can still do a
+  // name-only update.
+  if (req.body && req.body.scopeLevel !== undefined) {
+    const scope = normalizeScope(req.body);
+    if (scope.error) return res.status(400).json({ error: scope.error });
+    updates.push('scope_level = :sl', 'scope_project_id = :spid',
+                 'scope_location_id = :slid', 'scope_device_id = :sdid',
+                 'scope_count = :scnt');
+    binds.sl   = scope.scopeLevel;
+    binds.spid = scope.scopeProjectId;
+    binds.slid = scope.scopeLocationId;
+    binds.sdid = scope.scopeDeviceId;
+    binds.scnt = scope.scopeCount;
+  }
+
   if (updates.length === 0) return res.status(400).json({ error: 'nothing to update' });
   updates.push('updated_at = SYSTIMESTAMP');
 
@@ -537,8 +991,11 @@ router.put('/roles/:id', requirePermission('user.assign_role'), async (req, res)
       binds
     );
     if ((r.rowsAffected || 0) === 0) return res.status(404).json({ error: 'Role not found' });
+    // Changing a role's scope changes what its holders can reach.
+    invalidateUserPermsCache();
     res.json({ success: true });
   } catch (e) {
+    if (/ORA-02291/i.test(e.message)) return res.status(400).json({ error: 'Invalid scope target (project/location/device not found)' });
     res.status(500).json({ error: e.message });
   }
 });
