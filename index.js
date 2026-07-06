@@ -19,6 +19,7 @@ function targetFromReq(req) {
   const port = req.query.port ? parseInt(req.query.port) : undefined;
   return { deviceId, ip, port };
 }
+const oracledb = require('oracledb');
 const { initPool, closePool, getConnection, logDeviceAction, logFuelReading, getConsumptionRate, checkFuelAlarms } = require('./db');
 const { query, execute } = require('./db-helpers');
 const authRoutes  = require('./routes-auth');
@@ -351,6 +352,8 @@ app.get('/api/modbus/connect', authenticate, requirePermission('device.connect')
       if (result.ok) {
         currentDeviceConfig = config;
         currentDeviceId = deviceId;
+        // Mark the device online in the DB now that the TCP connect succeeded.
+        setDeviceStatus(deviceId, 'online');
         // Pre-warm thresholds cache so the first /fuel poll's background
         // work is just an INSERT (no SELECT for thresholds).
         getEffectiveThresholds(deviceId).catch(() => {});
@@ -419,6 +422,8 @@ app.get('/api/modbus/disconnect', authenticate, requirePermission('device.connec
   try {
     const target = targetFromReq(req);
     await disconnectModbus(target);   // closes only this device's hub
+    // Mark the device offline in the DB now that its hub is closed.
+    if (target.deviceId) setDeviceStatus(target.deviceId, 'offline');
     // Clear the CLI globals only if they pointed at the same device.
     if (target.deviceId && target.deviceId === currentDeviceId) {
       currentDeviceConfig = null;
@@ -594,6 +599,23 @@ app.get('/api/modbus/fuel', authenticate, requirePermission('fuel.read'), async 
     res.status(500).json({ error: e.message });
   }
 });
+
+// ── Device online/offline status ─────────────────────────────────────────────
+// Flip the persisted status column so the Projects/Dashboard lists reflect the
+// live connection state. Fire-and-forget: never block a connect/disconnect on it.
+async function setDeviceStatus(deviceId, status) {
+  if (!deviceId) return;
+  try {
+    // Going online also refreshes last_seen (the device is reachable right now).
+    const sql = status === 'online'
+      ? `UPDATE MODBUS_ADMIN.devices SET status = :status, last_seen = SYSTIMESTAMP WHERE device_id = :id`
+      : `UPDATE MODBUS_ADMIN.devices SET status = :status WHERE device_id = :id`;
+    await execute(sql, { status, id: parseInt(deviceId) });
+    console.log(`[Status] Device ${deviceId} -> ${status}`);
+  } catch (e) {
+    console.warn(`[Status] update failed for device ${deviceId}:`, e.message);
+  }
+}
 
 // ── GPS position ────────────────────────────────────────────────────────────
 // Persist a live GPS reading onto the device row so the Dashboard map can show
@@ -1039,7 +1061,10 @@ app.get('/api/locations/:locationId/devices', authenticate, requirePermission('d
   if (!Number.isInteger(locationId) || locationId <= 0) return res.status(400).json({ error: 'Invalid location ID' });
   try {
     const rows = await query(
-      'SELECT device_id as id, device_name as name, device_ip as ip, device_port as port, status, location_id, latitude, longitude, altitude FROM MODBUS_ADMIN.devices WHERE location_id = :locationId ORDER BY device_name',
+      `SELECT d.device_id as id, d.device_name as name, d.device_ip as ip, d.device_port as port, d.status, d.location_id, d.latitude, d.longitude, d.altitude, d.last_seen, d.brand_id, b.brand_name
+         FROM MODBUS_ADMIN.devices d
+         LEFT JOIN MODBUS_ADMIN.brands b ON b.brand_id = d.brand_id
+        WHERE d.location_id = :locationId ORDER BY d.device_name`,
       [locationId]
     );
     res.json(rows);
@@ -1076,25 +1101,27 @@ app.get('/api/project-tree', authenticate, requirePermission('project.read'), as
 // Update /api/devices to support filters and location_id
 app.get('/api/devices', authenticate, async (req, res) => {
   const { location_id, project_id, status } = req.query;
-  let sql = 'SELECT device_id as id, device_name as name, device_ip as ip, device_port as port, status, location_id, latitude, longitude, altitude FROM MODBUS_ADMIN.devices';
+  let sql = `SELECT d.device_id as id, d.device_name as name, d.device_ip as ip, d.device_port as port, d.status, d.location_id, d.latitude, d.longitude, d.altitude, d.last_seen, d.brand_id, b.brand_name
+               FROM MODBUS_ADMIN.devices d
+               LEFT JOIN MODBUS_ADMIN.brands b ON b.brand_id = d.brand_id`;
   const binds = [];
   const conditions = [];
   if (location_id) {
-    conditions.push('location_id = :location_id');
+    conditions.push('d.location_id = :location_id');
     binds.push(parseInt(location_id));
   }
   if (project_id) {
-    conditions.push('location_id IN (SELECT id FROM MODBUS_ADMIN.locations WHERE project_id = :project_id)');
+    conditions.push('d.location_id IN (SELECT id FROM MODBUS_ADMIN.locations WHERE project_id = :project_id)');
     binds.push(parseInt(project_id));
   }
   if (status) {
-    conditions.push('status = :status');
+    conditions.push('d.status = :status');
     binds.push(status);
   }
   if (conditions.length > 0) {
     sql += ' WHERE ' + conditions.join(' AND ');
   }
-  sql += ' ORDER BY device_name';
+  sql += ' ORDER BY d.device_name';
   try {
     const rows = await query(sql, binds);
     // Scope filter: return only devices the user can see (global sees all;
@@ -1109,7 +1136,7 @@ app.get('/api/devices', authenticate, async (req, res) => {
 
 // Update POST /api/devices to support location_id
 app.post('/api/devices', authenticate, requirePermission('device.write'), async (req, res) => {
-  const { id, name, ip, port, status, location_id, latitude, longitude } = req.body;
+  const { id, name, ip, port, status, location_id, latitude, longitude, brand_id } = req.body;
   console.log('POST devices body:', req.body);
   try {
     let device_id = parseInt(id);
@@ -1128,6 +1155,10 @@ app.post('/api/devices', authenticate, requirePermission('device.write'), async 
     if (location_id) {
       columns.push('location_id');
       bindsObj.location_id = parseInt(location_id);
+    }
+    if (brand_id !== undefined && brand_id !== null && brand_id !== '') {
+      columns.push('brand_id');
+      bindsObj.brand_id = parseInt(brand_id);
     }
     // Optional manual GPS coordinates (also auto-filled from Modbus when connected)
     if (latitude !== undefined && latitude !== null && latitude !== '' && !isNaN(parseFloat(latitude))) {
@@ -1158,27 +1189,67 @@ app.post('/api/devices', authenticate, requirePermission('device.write'), async 
 // Update PUT /api/devices/:id to support location_id
 app.put('/api/devices/:deviceId', authenticate, requirePermission('device.write'), async (req, res) => {
   const deviceId = parseInt(req.params.deviceId);
-  const { name, ip, port, status, location_id, latitude, longitude } = req.body;
-  const updates = ['device_name = :name', 'device_ip = :ip', 'device_port = :port', 'status = :status'];
-  const bindsObj = { name, ip, port: parseInt(port), status, id: deviceId };
+  const { name, ip, port, status, location_id, latitude, longitude, last_seen, brand_id } = req.body;
+  // Partial update: only touch the columns actually present in the request, so
+  // a coordinates-only save doesn't null out (or NaN) name/ip/port/status.
+  const updates = [];
+  const bindsObj = { id: deviceId };
+
+  if (name !== undefined)   { updates.push('device_name = :name'); bindsObj.name = name; }
+  if (ip !== undefined)     { updates.push('device_ip = :ip');     bindsObj.ip = ip; }
+  if (port !== undefined) {
+    const p = parseInt(port);
+    if (Number.isNaN(p)) return res.status(400).json({ error: 'Invalid port' });
+    updates.push('device_port = :port'); bindsObj.port = p;
+  }
+  if (status !== undefined) { updates.push('status = :status'); bindsObj.status = status; }
+  // Optional last_seen: accept an ISO-8601 string, or send now via SYSTIMESTAMP
+  // when the client passes the literal "now".
+  if (last_seen !== undefined) {
+    if (last_seen === 'now' || last_seen === null) {
+      updates.push('last_seen = SYSTIMESTAMP');
+    } else {
+      const d = new Date(last_seen);
+      if (Number.isNaN(d.getTime())) return res.status(400).json({ error: 'Invalid last_seen' });
+      updates.push('last_seen = :last_seen');
+      bindsObj.last_seen = d;
+    }
+  }
   if (location_id !== undefined) {
     updates.push('location_id = :location_id');
     bindsObj.location_id = location_id ? parseInt(location_id) : null;
   }
+  // Brand assignment. Empty string / null clears it.
+  if (brand_id !== undefined) {
+    updates.push('brand_id = :brand_id');
+    bindsObj.brand_id = (brand_id === '' || brand_id === null) ? null : parseInt(brand_id);
+  }
   // Manual GPS coordinate edits. Empty string clears the coordinate.
   if (latitude !== undefined) {
-    updates.push('latitude = :latitude', 'gps_updated_at = :gps_updated_at');
-    bindsObj.latitude = (latitude === '' || latitude === null) ? null : parseFloat(latitude);
-    bindsObj.gps_updated_at = new Date();
-  }
-  if (longitude !== undefined) {
-    updates.push('longitude = :longitude');
-    bindsObj.longitude = (longitude === '' || longitude === null) ? null : parseFloat(longitude);
+    const lat = (latitude === '' || latitude === null) ? null : parseFloat(latitude);
+    if (lat !== null && Number.isNaN(lat)) return res.status(400).json({ error: 'Invalid latitude' });
+    updates.push('latitude = :latitude');
+    bindsObj.latitude = lat;
     if (bindsObj.gps_updated_at === undefined) {
       updates.push('gps_updated_at = :gps_updated_at');
       bindsObj.gps_updated_at = new Date();
     }
   }
+  if (longitude !== undefined) {
+    const lon = (longitude === '' || longitude === null) ? null : parseFloat(longitude);
+    if (lon !== null && Number.isNaN(lon)) return res.status(400).json({ error: 'Invalid longitude' });
+    updates.push('longitude = :longitude');
+    bindsObj.longitude = lon;
+    if (bindsObj.gps_updated_at === undefined) {
+      updates.push('gps_updated_at = :gps_updated_at');
+      bindsObj.gps_updated_at = new Date();
+    }
+  }
+
+  if (updates.length === 0) {
+    return res.status(400).json({ error: 'No fields to update' });
+  }
+
   const setClause = updates.join(', ');
   try {
     const result = await execute(
@@ -1195,8 +1266,107 @@ app.put('/api/devices/:deviceId', authenticate, requirePermission('device.write'
   }
 });
 
+// PATCH /api/devices/:id/last-seen — stamp LAST_SEEN = now.
+// Called by the frontend right after a successful Modbus connect.
+app.patch('/api/devices/:deviceId/last-seen', authenticate, requirePermission('device.write'), async (req, res) => {
+  const deviceId = parseInt(req.params.deviceId);
+  if (!Number.isInteger(deviceId) || deviceId <= 0) {
+    return res.status(400).json({ error: 'Invalid device id' });
+  }
+  try {
+    const result = await execute(
+      `UPDATE MODBUS_ADMIN.devices SET last_seen = SYSTIMESTAMP WHERE device_id = :id`,
+      { id: deviceId }
+    );
+    if ((result.rowsAffected || 0) === 0) {
+      return res.status(404).json({ error: 'Device not found' });
+    }
+    res.json({ success: true, last_seen: new Date().toISOString() });
+  } catch (e) {
+    console.error('PATCH /api/devices/:id/last-seen error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Update DELETE to handle location_id dependencies if needed (existing handles child tables)
 
+
+// ============================================================================
+// BRANDS API
+// ============================================================================
+// Brands are a small lookup table (id + name). Devices reference a brand via
+// devices.brand_id (nullable FK, ON DELETE SET NULL). Viewing needs
+// device.read; managing needs device.write.
+
+app.get('/api/brands', authenticate, requirePermission('device.read'), async (_, res) => {
+  try {
+    const rows = await query(
+      `SELECT b.brand_id AS id, b.brand_name AS name, b.created_at,
+              (SELECT COUNT(*) FROM MODBUS_ADMIN.devices d WHERE d.brand_id = b.brand_id) AS device_count
+         FROM MODBUS_ADMIN.brands b
+        ORDER BY b.brand_name`
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error('GET /api/brands error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/brands', authenticate, requirePermission('device.write'), async (req, res) => {
+  const name = String(req.body?.name ?? '').trim();
+  if (!name) return res.status(400).json({ error: 'Name required' });
+  try {
+    const result = await execute(
+      `INSERT INTO MODBUS_ADMIN.brands (brand_name) VALUES (:name)
+         RETURNING brand_id INTO :id`,
+      { name, id: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER } }
+    );
+    res.status(201).json({ success: true, id: result.outBinds?.id?.[0] ?? null, name });
+  } catch (e) {
+    if (/uq_brands_name|unique constraint/i.test(e.message)) {
+      return res.status(409).json({ error: 'Brand name must be unique' });
+    }
+    console.error('POST /api/brands error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/brands/:id', authenticate, requirePermission('device.write'), async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid brand id' });
+  const name = String(req.body?.name ?? '').trim();
+  if (!name) return res.status(400).json({ error: 'Name required' });
+  try {
+    const result = await execute(
+      `UPDATE MODBUS_ADMIN.brands SET brand_name = :name WHERE brand_id = :id`,
+      { name, id }
+    );
+    if ((result.rowsAffected || 0) === 0) return res.status(404).json({ error: 'Brand not found' });
+    res.json({ success: true, id, name });
+  } catch (e) {
+    if (/uq_brands_name|unique constraint/i.test(e.message)) {
+      return res.status(409).json({ error: 'Brand name must be unique' });
+    }
+    console.error('PUT /api/brands/:id error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/brands/:id', authenticate, requirePermission('device.write'), async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid brand id' });
+  try {
+    // FK is ON DELETE SET NULL, so any devices using this brand keep existing
+    // with brand_id cleared.
+    const result = await execute(`DELETE FROM MODBUS_ADMIN.brands WHERE brand_id = :id`, { id });
+    if ((result.rowsAffected || 0) === 0) return res.status(404).json({ error: 'Brand not found' });
+    res.json({ success: true, deleted: id });
+  } catch (e) {
+    console.error('DELETE /api/brands/:id error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ============================================================================
 // DEVICE SETTINGS API
