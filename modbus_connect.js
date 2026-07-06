@@ -1,114 +1,131 @@
 /**
  * modbus_connect.js
  *
- * Manages a single persistent Modbus TCP session with:
- *  - Named session (device config stored in memory)
- *  - Automatic reconnect when the socket drops
- *  - Configurable timeout read from system_settings DB table
- *  - Detailed human-readable errors on connect failure
+ * Per-DEVICE Modbus TCP connection manager.
+ *
+ * Previously this module kept ONE global client for the whole server, so a
+ * second user connecting would tear down the first user's socket and repoint
+ * the shared client — reads and (dangerously) Start/Stop commands could hit the
+ * wrong physical device.
+ *
+ * Now every device gets its own "hub" (client + session + a per-device request
+ * lock), kept in `hubs` keyed by device id (or ip:port for manual connects):
+ *   - Two users on the SAME device share that device's one socket (Modbus TCP
+ *     slaves usually allow a single connection).
+ *   - Two users on DIFFERENT devices get independent sockets.
+ *   - All reads/writes on a device are serialized through its lock so requests
+ *     from different users never interleave on the one socket.
+ *
+ * Every public op takes a `target` ({ deviceId? , ip?, port? }) identifying which
+ * hub to act on. Auto-reconnect, timeouts, and friendly errors are per-hub.
  */
 
 const ModbusRTU = require('modbus-serial');
 const { getConnection } = require('./db');
 require('dotenv').config();
 
-// ── Single shared client ──────────────────────────────────────────────────
-const client = new ModbusRTU();
-
-// ── Session state ─────────────────────────────────────────────────────────
-let _connected   = false;
-
-// What we are (or were last) connected to — persists across reconnect cycles
-const _session = {
-  deviceId:   null,   // numeric DB device_id (null for manual)
-  ip:         null,
-  port:       null,
-  name:       null,
-  connectedAt: null,  // Date when connection was established
-};
-
-// ── Auto-reconnect state ──────────────────────────────────────────────────
-let _autoReconnect  = false;   // enabled once first explicit connect() succeeds
-let _reconnectTimer = null;
-const RECONNECT_INTERVAL_MS = 10_000;  // try every 10 s after a drop
-
 // ── Env defaults ──────────────────────────────────────────────────────────
 const DEFAULT_IP      = process.env.MODBUS_IP   || '192.168.1.20';
 const DEFAULT_PORT    = parseInt(process.env.MODBUS_PORT) || 502;
 const DEFAULT_TIMEOUT = 5000;
+const RECONNECT_INTERVAL_MS = 10_000; // retry a dropped hub every 10 s
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Socket listener — keeps _connected accurate, triggers auto-reconnect
-// ─────────────────────────────────────────────────────────────────────────────
-function _attachSocketListeners() {
-  const socket = client._port?._client ?? client._port?.socket ?? null;
+// ── Hub registry ────────────────────────────────────────────────────────────
+// key -> hub. key is `d:<deviceId>` for DB devices, `m:<ip>:<port>` for manual.
+const hubs = new Map();
+
+function hubKey({ deviceId = null, ip = null, port = null } = {}) {
+  if (deviceId != null && deviceId !== '') return `d:${parseInt(deviceId)}`;
+  if (ip) return `m:${ip}:${port || DEFAULT_PORT}`;
+  return null;
+}
+
+function getOrCreateHub(key, meta) {
+  let hub = hubs.get(key);
+  if (!hub) {
+    hub = {
+      key,
+      deviceId:   meta.deviceId ?? null,
+      ip:         meta.ip,
+      port:       meta.port,
+      name:       meta.name || 'Device',
+      client:     new ModbusRTU(),
+      connected:  false,
+      connectedAt: null,
+      autoReconnect: false,
+      reconnectTimer: null,
+      lock:       Promise.resolve(), // per-device request mutex (promise chain)
+    };
+    hubs.set(key, hub);
+  } else {
+    if (meta.ip)   hub.ip = meta.ip;
+    if (meta.port) hub.port = meta.port;
+    if (meta.name) hub.name = meta.name;
+    if (meta.deviceId != null) hub.deviceId = meta.deviceId;
+  }
+  return hub;
+}
+
+// Resolve an existing hub from request params. Falls back to the only hub when
+// no target is given (keeps the single-device CLI / legacy callers working).
+function resolveHub(target = {}) {
+  const key = hubKey(target);
+  if (key) return hubs.get(key) || null;
+  if (hubs.size === 1) return [...hubs.values()][0];
+  return null;
+}
+
+// Serialize every socket op on a hub: chain onto its lock so two users' reads
+// or writes never interleave on the one Modbus TCP connection.
+function withLock(hub, fn) {
+  const run = hub.lock.then(fn, fn);
+  hub.lock = run.then(() => {}, () => {}); // swallow so the chain never rejects
+  return run;
+}
+
+// ── Socket listeners (per hub) ──────────────────────────────────────────────
+function attachSocketListeners(hub) {
+  const socket = hub.client._port?._client ?? hub.client._port?.socket ?? null;
   if (!socket || socket._modbusHubPatched) return;
   socket._modbusHubPatched = true;
 
   socket.on('close', () => {
-    if (!_connected) return;
-    console.warn('[Modbus] Socket closed — session dropped');
-    _connected = false;
-    _scheduleReconnect();
+    if (!hub.connected) return;
+    console.warn(`[Modbus] Socket closed — ${hub.name} (${hub.key}) dropped`);
+    hub.connected = false;
+    scheduleReconnect(hub);
   });
-
   socket.on('error', (err) => {
-    if (!_connected) return;
-    console.error('[Modbus] Socket error:', err.message);
-    _connected = false;
-    _scheduleReconnect();
+    if (!hub.connected) return;
+    console.error(`[Modbus] Socket error on ${hub.name} (${hub.key}):`, err.message);
+    hub.connected = false;
+    scheduleReconnect(hub);
   });
 }
 
-// Patch connectTCP so listeners are attached after every connect call
-const _origConnectTCP = client.connectTCP.bind(client);
-client.connectTCP = async function (...args) {
-  const result = await _origConnectTCP(...args);
-  _attachSocketListeners();
-  return result;
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Auto-reconnect scheduler
-// ─────────────────────────────────────────────────────────────────────────────
-function _scheduleReconnect() {
-  if (!_autoReconnect) return;
-  if (_reconnectTimer) return; // already scheduled
-
-  console.log(`[Modbus] Auto-reconnect in ${RECONNECT_INTERVAL_MS / 1000}s…`);
-  _reconnectTimer = setTimeout(async () => {
-    _reconnectTimer = null;
-    if (_connected) return; // recovered by something else
-
-    if (!_session.ip) return; // no session to restore
-
-    console.log(`[Modbus] Auto-reconnect attempt → ${_session.name} @ ${_session.ip}:${_session.port}`);
-    const result = await _rawConnect(_session.ip, _session.port, _session.name);
-    if (result.ok) {
-      console.log('[Modbus] ✓ Auto-reconnect succeeded');
-    } else {
-      console.warn('[Modbus] ✗ Auto-reconnect failed:', result.error);
-      _scheduleReconnect(); // try again after another interval
-    }
+// ── Auto-reconnect (per hub) ────────────────────────────────────────────────
+function scheduleReconnect(hub) {
+  if (!hub.autoReconnect || hub.reconnectTimer) return;
+  console.log(`[Modbus] Auto-reconnect for ${hub.name} in ${RECONNECT_INTERVAL_MS / 1000}s…`);
+  hub.reconnectTimer = setTimeout(async () => {
+    hub.reconnectTimer = null;
+    if (hub.connected || !hub.ip) return;
+    const r = await withLock(hub, () => rawConnect(hub));
+    if (r.ok) console.log(`[Modbus] ✓ Auto-reconnect ${hub.name}`);
+    else { console.warn(`[Modbus] ✗ Auto-reconnect ${hub.name}: ${r.error}`); scheduleReconnect(hub); }
   }, RECONNECT_INTERVAL_MS);
 }
 
-function _cancelReconnect() {
-  if (_reconnectTimer) {
-    clearTimeout(_reconnectTimer);
-    _reconnectTimer = null;
-  }
+function cancelReconnect(hub) {
+  if (hub.reconnectTimer) { clearTimeout(hub.reconnectTimer); hub.reconnectTimer = null; }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Read CONNECTION_TIMEOUT from system_settings (uses pool — fast)
-// Cached for TIMEOUT_CACHE_MS so we don't hit the DB on every reconnect/poll.
-// ─────────────────────────────────────────────────────────────────────────────
+// ── CONNECTION_TIMEOUT from system_settings (cached) ────────────────────────
 let _cachedTimeoutMs = null;
 let _cachedTimeoutAt = 0;
-const TIMEOUT_CACHE_MS = 5 * 60_000; // 5 min
+const TIMEOUT_CACHE_MS = 5 * 60_000;
 
-async function _getTimeoutMs() {
+async function getTimeoutMs() {
   if (_cachedTimeoutMs !== null && (Date.now() - _cachedTimeoutAt) < TIMEOUT_CACHE_MS) {
     return _cachedTimeoutMs;
   }
@@ -120,11 +137,7 @@ async function _getTimeoutMs() {
     );
     if (result.rows?.length > 0) {
       const val = parseInt(result.rows[0][0]);
-      if (!isNaN(val) && val > 0) {
-        _cachedTimeoutMs = val;
-        _cachedTimeoutAt = Date.now();
-        return val;
-      }
+      if (!isNaN(val) && val > 0) { _cachedTimeoutMs = val; _cachedTimeoutAt = Date.now(); return val; }
     }
   } catch { /* ignore */ } finally {
     await conn.close().catch(() => {});
@@ -134,9 +147,7 @@ async function _getTimeoutMs() {
   return DEFAULT_TIMEOUT;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Get device config from DB (uses pool — fast)
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Device config from DB ───────────────────────────────────────────────────
 async function getDeviceConfig(deviceId = null) {
   const connection = await getConnection();
   if (!connection) {
@@ -148,7 +159,6 @@ async function getDeviceConfig(deviceId = null) {
       name: 'DB Fallback Device',
     };
   }
-
   try {
     let result;
     if (deviceId) {
@@ -159,32 +169,18 @@ async function getDeviceConfig(deviceId = null) {
     } else {
       result = await connection.execute(
         `SELECT device_id, device_ip, device_port, device_name
-         FROM MODBUS_ADMIN.devices
-         WHERE status = 'online'
-         ORDER BY device_id
-         FETCH FIRST 1 ROWS ONLY`,
-        []
+           FROM MODBUS_ADMIN.devices WHERE status = 'online'
+          ORDER BY device_id FETCH FIRST 1 ROWS ONLY`, []
       );
       if (!result.rows?.length) {
         result = await connection.execute(
-          'SELECT device_id, device_ip, device_port, device_name FROM MODBUS_ADMIN.devices ORDER BY device_id FETCH FIRST 1 ROWS ONLY',
-          []
+          'SELECT device_id, device_ip, device_port, device_name FROM MODBUS_ADMIN.devices ORDER BY device_id FETCH FIRST 1 ROWS ONLY', []
         );
       }
     }
-
-    if (!result.rows?.length) {
-      console.warn('[Modbus] No devices found in database');
-      return null;
-    }
-
+    if (!result.rows?.length) { console.warn('[Modbus] No devices found in database'); return null; }
     const row = result.rows[0];
-    const config = {
-      device_id: row[0],
-      ip:   row[1],
-      port: parseInt(row[2]),
-      name: row[3] || 'Unknown',
-    };
+    const config = { device_id: row[0], ip: row[1], port: parseInt(row[2]), name: row[3] || 'Unknown' };
     console.log(`[Modbus] Device config: ${config.name} @ ${config.ip}:${config.port}`);
     return config;
   } catch (err) {
@@ -195,179 +191,221 @@ async function getDeviceConfig(deviceId = null) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal raw TCP connect (no session bookkeeping)
-// Returns { ok: true } or { ok: false, error: string }
-// ─────────────────────────────────────────────────────────────────────────────
-async function _rawConnect(ip, port, name) {
-  const timeoutMs = await _getTimeoutMs();
-  console.log(`[Modbus] Connecting to ${name} @ ${ip}:${port} (timeout ${timeoutMs}ms)…`);
-
+// ── Raw TCP connect for a hub ───────────────────────────────────────────────
+async function rawConnect(hub) {
+  const timeoutMs = await getTimeoutMs();
+  console.log(`[Modbus] Connecting to ${hub.name} @ ${hub.ip}:${hub.port} (timeout ${timeoutMs}ms)…`);
   try {
-    // Close cleanly if there's an old socket
-    if (_connected) {
-      try { await client.close(); } catch (_) {}
-      _connected = false;
-    }
-
+    if (hub.connected) { try { await hub.client.close(); } catch (_) {} hub.connected = false; }
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(
-        () => reject(new Error(`Connection timed out after ${timeoutMs}ms — device may be off or unreachable at ${ip}:${port}`)),
-        timeoutMs
-      )
+      setTimeout(() => reject(new Error(
+        `Connection timed out after ${timeoutMs}ms — device may be off or unreachable at ${hub.ip}:${hub.port}`
+      )), timeoutMs)
     );
-
-    await Promise.race([client.connectTCP(ip, { port }), timeoutPromise]);
-    _attachSocketListeners();
-    _connected = true;
-    console.log(`[Modbus] ✓ Connected to ${name} @ ${ip}:${port}`);
+    await Promise.race([hub.client.connectTCP(hub.ip, { port: hub.port }), timeoutPromise]);
+    attachSocketListeners(hub);
+    hub.connected = true;
+    hub.connectedAt = new Date().toISOString();
+    console.log(`[Modbus] ✓ Connected to ${hub.name} @ ${hub.ip}:${hub.port}`);
     return { ok: true };
   } catch (err) {
-    _connected = false;
+    hub.connected = false;
     let reason = err.message || 'Unknown error';
-    if (/ECONNREFUSED/i.test(reason))
-      reason = `Connection refused — no Modbus listener at ${ip}:${port} (ECONNREFUSED)`;
-    else if (/EHOSTUNREACH|ENETUNREACH/i.test(reason))
-      reason = `Host unreachable — check network/IP address (${reason})`;
-    else if (/ETIMEDOUT|timed out/i.test(reason))
-      reason = `Connection timed out — device may be powered off or firewall is blocking port ${port}`;
-    else if (/ENOTFOUND/i.test(reason))
-      reason = `Hostname not found — verify the IP address`;
-    console.error(`[Modbus] ✗ Connect failed: ${reason}`);
+    if (/ECONNREFUSED/i.test(reason))            reason = `Connection refused — no Modbus listener at ${hub.ip}:${hub.port} (ECONNREFUSED)`;
+    else if (/EHOSTUNREACH|ENETUNREACH/i.test(reason)) reason = `Host unreachable — check network/IP address (${reason})`;
+    else if (/ETIMEDOUT|timed out/i.test(reason)) reason = `Connection timed out — device may be powered off or firewall is blocking port ${hub.port}`;
+    else if (/ENOTFOUND/i.test(reason))           reason = `Hostname not found — verify the IP address`;
+    console.error(`[Modbus] ✗ Connect failed (${hub.name}): ${reason}`);
     return { ok: false, error: reason };
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Public connect — resolves config, connects, stores session, starts auto-reconnect
-// Returns { ok: true } or { ok: false, error: string }
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Public: connect ─────────────────────────────────────────────────────────
+// Get-or-create the device's hub and connect it. If already connected, the
+// caller simply shares the existing socket (returns ok immediately).
 async function connectModbus(deviceId = null, ipOverride = null, portOverride = null) {
-  _cancelReconnect(); // stop any pending retry before explicit connect
-
-  let config;
-  if (deviceId) {
-    config = await getDeviceConfig(parseInt(deviceId));
-    if (!config) return { ok: false, error: `Device ID ${deviceId} not found in database` };
+  let meta;
+  if (deviceId != null) {
+    const cfg = await getDeviceConfig(parseInt(deviceId));
+    if (!cfg) return { ok: false, error: `Device ID ${deviceId} not found in database` };
+    meta = { deviceId: cfg.device_id, ip: cfg.ip, port: cfg.port, name: cfg.name };
   } else if (ipOverride) {
-    config = { ip: ipOverride, port: portOverride || DEFAULT_PORT, name: 'Manual', device_id: null };
+    meta = { deviceId: null, ip: ipOverride, port: portOverride || DEFAULT_PORT, name: 'Manual' };
   } else {
-    config = await getDeviceConfig();
-    if (!config) return { ok: false, error: 'No devices found in database' };
+    const cfg = await getDeviceConfig();
+    if (!cfg) return { ok: false, error: 'No devices found in database' };
+    meta = { deviceId: cfg.device_id, ip: cfg.ip, port: cfg.port, name: cfg.name };
   }
 
-  const result = await _rawConnect(config.ip, config.port, config.name);
+  const key = hubKey(meta);
+  const hub = getOrCreateHub(key, meta);
+  cancelReconnect(hub);
 
-  if (result.ok) {
-    // Persist session so it survives tab switches
-    _session.deviceId    = config.device_id ?? null;
-    _session.ip          = config.ip;
-    _session.port        = config.port;
-    _session.name        = config.name;
-    _session.connectedAt = new Date().toISOString();
-    _autoReconnect = true; // arm auto-reconnect for this session
-  }
+  // Already connected → share it (second user joins the same socket).
+  if (hub.connected) return { ok: true, deviceId: hub.deviceId, shared: true };
 
-  return result;
+  const result = await withLock(hub, () => rawConnect(hub));
+  if (result.ok) hub.autoReconnect = true; // arm reconnect for this hub
+  return { ...result, deviceId: hub.deviceId };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Public disconnect — clears session and disables auto-reconnect
-// ─────────────────────────────────────────────────────────────────────────────
-async function disconnectModbus() {
-  _cancelReconnect();
-  _autoReconnect = false;
-
-  // Clear session
-  _session.deviceId    = null;
-  _session.ip          = null;
-  _session.port        = null;
-  _session.name        = null;
-  _session.connectedAt = null;
-
-  if (_connected) {
-    try { await client.close(); } catch (_) {}
-    _connected = false;
-    console.log('[Modbus] Disconnected by user');
+// ── Public: disconnect ──────────────────────────────────────────────────────
+async function disconnectModbus(target = {}) {
+  const hub = resolveHub(target);
+  if (!hub) return;
+  cancelReconnect(hub);
+  hub.autoReconnect = false;
+  if (hub.connected) {
+    try { await hub.client.close(); } catch (_) {}
+    hub.connected = false;
+    console.log(`[Modbus] Disconnected ${hub.name} by user`);
   }
+  hubs.delete(hub.key);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Return current session snapshot (for /api/modbus/session endpoint)
-// ─────────────────────────────────────────────────────────────────────────────
+// Close every hub (graceful server shutdown).
+async function closeAll() {
+  for (const hub of hubs.values()) {
+    cancelReconnect(hub);
+    if (hub.connected) { try { await hub.client.close(); } catch (_) {} hub.connected = false; }
+  }
+  hubs.clear();
+}
+
+// ── Public: session snapshot (all hubs) ─────────────────────────────────────
 function getSession() {
+  const devices = [];
+  for (const hub of hubs.values()) {
+    devices.push({
+      deviceId:    hub.deviceId,
+      ip:          hub.ip,
+      port:        hub.port,
+      name:        hub.name,
+      connected:   hub.connected,
+      autoReconnect: hub.autoReconnect,
+      connectedAt: hub.connectedAt,
+    });
+  }
+  const firstConnected = devices.find((d) => d.connected) || null;
   return {
-    connected:    _connected,
-    autoReconnect: _autoReconnect,
-    deviceId:     _session.deviceId,
-    ip:           _session.ip,
-    port:         _session.port,
-    name:         _session.name,
-    connectedAt:  _session.connectedAt,
+    connected: devices.some((d) => d.connected),
+    deviceId:  firstConnected?.deviceId ?? null, // legacy single-device field
+    devices,
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Controls / readings
-// ─────────────────────────────────────────────────────────────────────────────
-async function stopButton() {
-  try {
-    if (!_connected) { console.warn('[Modbus] Not connected'); return false; }
-    await client.writeRegister(8193, 1);
-    console.log('[Modbus] STOP sent (reg 8193 = 1)');
-    return true;
-  } catch (err) {
-    console.error('[Modbus] stopButton error:', err.message);
-    _connected = false;
-    _scheduleReconnect();
-    return false;
-  }
+function isConnected(target = {}) {
+  const hub = resolveHub(target);
+  return !!hub && hub.connected;
 }
 
-async function startButton() {
-  try {
-    if (!_connected) { console.warn('[Modbus] Not connected'); return false; }
-    await client.writeRegister(8193, 8);
-    console.log('[Modbus] START press (reg 8193 = 8)');
-    await new Promise((r) => setTimeout(r, 100));
-    await client.writeRegister(8193, 0);
-    console.log('[Modbus] START release (reg 8193 = 0)');
-    return true;
-  } catch (err) {
-    console.error('[Modbus] startButton error:', err.message);
-    _connected = false;
-    _scheduleReconnect();
-    return false;
-  }
+// ── Controls / readings (per hub, serialized) ───────────────────────────────
+async function stopButton(target = {}) {
+  const hub = resolveHub(target);
+  if (!hub || !hub.connected) { console.warn('[Modbus] Not connected (stop)'); return false; }
+  return withLock(hub, async () => {
+    try {
+      await hub.client.writeRegister(8193, 1);
+      console.log(`[Modbus] STOP → ${hub.name} (reg 8193 = 1)`);
+      return true;
+    } catch (err) {
+      console.error(`[Modbus] stopButton error (${hub.name}):`, err.message);
+      hub.connected = false; scheduleReconnect(hub); return false;
+    }
+  });
 }
 
-async function readFuel() {
-  try {
-    if (!_connected) { console.warn('[Modbus] Not connected'); return null; }
-    const res  = await client.readHoldingRegisters(10363, 1);
-    const fuel = res.data[0] / 10;
-    console.log(`[Modbus] Fuel: ${fuel}%`);
-    return fuel;
-  } catch (err) {
-    console.error('[Modbus] readFuel error:', err.message);
-    _connected = false;
-    _scheduleReconnect();
-    return null;
-  }
+async function startButton(target = {}) {
+  const hub = resolveHub(target);
+  if (!hub || !hub.connected) { console.warn('[Modbus] Not connected (start)'); return false; }
+  return withLock(hub, async () => {
+    try {
+      await hub.client.writeRegister(8193, 8);
+      await new Promise((r) => setTimeout(r, 100));
+      await hub.client.writeRegister(8193, 0);
+      console.log(`[Modbus] START → ${hub.name} (reg 8193 press/release)`);
+      return true;
+    } catch (err) {
+      console.error(`[Modbus] startButton error (${hub.name}):`, err.message);
+      hub.connected = false; scheduleReconnect(hub); return false;
+    }
+  });
 }
 
-function isConnected() { return _connected; }
-function getClient()    { return client; }
+async function readFuel(target = {}) {
+  const hub = resolveHub(target);
+  if (!hub || !hub.connected) { console.warn('[Modbus] Not connected (fuel)'); return null; }
+  return withLock(hub, async () => {
+    try {
+      const res  = await hub.client.readHoldingRegisters(10363, 1);
+      const fuel = res.data[0] / 10;
+      return fuel;
+    } catch (err) {
+      console.error(`[Modbus] readFuel error (${hub.name}):`, err.message);
+      hub.connected = false; scheduleReconnect(hub); return null;
+    }
+  });
+}
+
+// ── GPS position (registers 10594/10596/10598, 32-bit each) ─────────────────
+// The manual's DATA FORMATS section: 32-bit values span two consecutive
+// registers, high word first — so reading 6 registers from 10594 gives a 12-byte
+// buffer we decode as three big-endian signed 32-bit integers (lat, lon, alt).
+//
+// The scale factor for these registers is NOT documented by Datakom. 1e6
+// (micro-degrees) is the most common GPS-over-Modbus encoding. If a connected
+// device reports coordinates that are off, calibrate GPS_DIVISOR against a known
+// position — the raw integers are logged and returned as latitudeRaw/longitudeRaw
+// so you can compute the correct factor in one step.
+const GPS_DIVISOR = 1_000_000; // raw integer -> decimal degrees
+
+async function readGps(target = {}) {
+  const hub = resolveHub(target);
+  if (!hub || !hub.connected) { console.warn('[Modbus] Not connected (gps)'); return null; }
+  return withLock(hub, async () => {
+    try {
+      // 10594 lat[2], 10596 lon[2], 10598 alt[2]
+      const res = await hub.client.readHoldingRegisters(10594, 6);
+      const buf = res.buffer; // 12 bytes, big-endian words
+      const latRaw = buf.readInt32BE(0);
+      const lonRaw = buf.readInt32BE(4);
+      const altRaw = buf.readInt32BE(8);
+
+      const latitude  = latRaw / GPS_DIVISOR;
+      const longitude = lonRaw / GPS_DIVISOR;
+      const altitude  = altRaw; // metres (no documented coefficient)
+
+      console.log(
+        `[Modbus] GPS ${hub.name}: raw lat=${latRaw} lon=${lonRaw} alt=${altRaw} ` +
+        `→ ${latitude}, ${longitude} (${altitude}m)`
+      );
+
+      // A device with no GPS fix usually reports 0/0; treat that as "no fix"
+      // rather than plotting a marker in the Gulf of Guinea.
+      const hasFix = latRaw !== 0 || lonRaw !== 0;
+      const valid  = Math.abs(latitude) <= 90 && Math.abs(longitude) <= 180;
+
+      return {
+        latitude, longitude, altitude,
+        latitudeRaw: latRaw, longitudeRaw: lonRaw, altitudeRaw: altRaw,
+        hasFix, valid,
+      };
+    } catch (err) {
+      console.error(`[Modbus] readGps error (${hub.name}):`, err.message);
+      hub.connected = false; scheduleReconnect(hub); return null;
+    }
+  });
+}
 
 module.exports = {
   connectModbus,
   disconnectModbus,
+  closeAll,
   getDeviceConfig,
   getSession,
   isConnected,
-  getClient,
   stopButton,
   startButton,
   readFuel,
-  client,
+  readGps,
 };
