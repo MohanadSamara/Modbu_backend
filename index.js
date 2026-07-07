@@ -29,11 +29,16 @@ const { visibleProjects, visibleLocationIds, filterVisibleDevices } = require('.
 const cors = require('cors');
 const app = express();
 
-const PORT = process.env.PORT || 3000;
+// Support --port <n> passed via CLI (e.g. npm run dev -- --port 5400)
+const _cliArgs = process.argv.slice(2);
+const _portArgIdx = _cliArgs.indexOf('--port');
+const PORT = (_portArgIdx !== -1 ? parseInt(_cliArgs[_portArgIdx + 1], 10) : null)
+          || parseInt(process.env.PORT, 10)
+          || 3000;
 
-app.use(cors({
-  origin: ['http://localhost:5173', 'http://localhost:3000']
-}));
+const _allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:5173,http://localhost:3000')
+  .split(',').map(o => o.trim()).filter(Boolean);
+app.use(cors({ origin: _allowedOrigins }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
