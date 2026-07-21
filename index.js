@@ -36,7 +36,7 @@ function targetFromReq(req) {
   return { deviceId, ip, port };
 }
 const oracledb = require('oracledb');
-const { initPool, closePool, getConnection, logDeviceAction, logFuelReading, getConsumptionRate, getFuelHistory, getEventTimes, checkFuelAlarms, ensureAlarmsTable, getActiveAlarms, acknowledgeAlarm, ensureSnoozeTable, getActiveSnoozes, setSnooze, ensureDatakomNodeNamesTable, getDatakomNodeNames, setDatakomNodeName, ensureProjectParentColumn, projectParentWouldCycle, ensurePageContentTable, getPageContent, savePageContent, ensureSettingsTables, ensureRbacSeed, ensureUiElementCatalog } = require('./db');
+const { initPool, closePool, getConnection, logDeviceAction, logFuelReading, getConsumptionRate, getFuelHistory, getEventTimes, checkFuelAlarms, ensureAlarmsTable, getActiveAlarms, acknowledgeAlarm, ensureSnoozeTable, getActiveSnoozes, setSnooze, ensureDatakomNodeNamesTable, getDatakomNodeNames, setDatakomNodeName, ensureDatakomNodeContainersTable, getDatakomNodeContainers, setDatakomNodeContainer, ensureProjectParentColumn, projectParentWouldCycle, ensurePageContentTable, getPageContent, savePageContent, ensureSettingsTables, ensureRbacSeed, ensureUiElementCatalog } = require('./db');
 const { query, execute } = require('./db-helpers');
 const authRoutes  = require('./routes-auth');
 const userRoutes  = require('./routes-users');
@@ -2119,6 +2119,33 @@ app.put('/api/brands/datakom/node-names/:nodeId', authenticate, requirePermissio
   }
 });
 
+// ── Datakom node containers (local grouping) ────────────────────────────────
+// Group cloud nodes into local container folders. Read is open to tree viewers;
+// write (assign/clear a node's container) requires datakom.write.
+app.get('/api/brands/datakom/node-containers', authenticate, requireAnyPermission(['device.read', 'datakom.read', 'fuel.read']), async (_req, res) => {
+  try {
+    res.json(await getDatakomNodeContainers());
+  } catch (e) {
+    console.error('GET /api/brands/datakom/node-containers error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/brands/datakom/node-containers/:nodeId', authenticate, requirePermission('datakom.write'), async (req, res) => {
+  const nodeId = String(req.params.nodeId || '').trim();
+  if (!nodeId) return res.status(400).json({ error: 'Missing node id' });
+  const container = (req.body?.container ?? '').toString();
+  if (container.length > 200) return res.status(400).json({ error: 'Container name too long (max 200)' });
+  try {
+    const ok = await setDatakomNodeContainer(nodeId, container, req.user?.id ?? null);
+    if (!ok) return res.status(500).json({ error: 'Failed to save container' });
+    res.json({ success: true, nodeId, container: container.trim() || null });
+  } catch (e) {
+    console.error('PUT /api/brands/datakom/node-containers error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Brand cloud control (start/stop) — SCAFFOLD ─────────────────────────────
 // Most brand adapters are read-only and omit sendControl → 501. Datakom's adapter
 // wires this end-to-end but stays INERT until the Rainbow command frame is known
@@ -2593,6 +2620,8 @@ async function ensureAckTable() {
     await ensureSnoozeTable();
     // Custom names for Datakom cloud nodes (renamed locally, cloud untouched).
     await ensureDatakomNodeNamesTable();
+    // Local grouping of Datakom cloud nodes into container folders.
+    await ensureDatakomNodeContainersTable();
     // Allow a project to live inside another (container/folder nesting).
     await ensureProjectParentColumn();
     // Auto-create the page_content table backing the admin visual page editor.

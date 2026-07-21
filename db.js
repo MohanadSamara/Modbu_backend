@@ -969,6 +969,89 @@ async function setDatakomNodeName(nodeId, name, userId = null) {
   }
 }
 
+// ── Datakom node containers (local grouping) ──────────────────────────────
+// Cloud nodes are read-only on Datakom, but users can group them into local
+// "container" folders. One row per node → the container name it belongs to.
+// Nodes sharing a container name render together; clearing sends a node back
+// to the top level.
+async function ensureDatakomNodeContainersTable() {
+  const conn = await getConnection();
+  if (!conn) return;
+  try {
+    await conn.execute(`
+      BEGIN
+        EXECUTE IMMEDIATE 'CREATE TABLE MODBUS_ADMIN.datakom_node_containers (
+          node_id        VARCHAR2(128) PRIMARY KEY,
+          container_name VARCHAR2(200) NOT NULL,
+          updated_by     NUMBER,
+          updated_at     TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL
+        )';
+      EXCEPTION
+        WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF;
+      END;
+    `);
+    console.log('[DB] datakom_node_containers table ready');
+  } catch (e) {
+    console.warn('[DB] ensureDatakomNodeContainersTable warning:', e.message);
+  } finally {
+    await conn.close().catch(() => {});
+  }
+}
+
+// Return all assignments as { nodeId: containerName }.
+async function getDatakomNodeContainers() {
+  const out = {};
+  const conn = await getConnection();
+  if (!conn) return out;
+  try {
+    const r = await conn.execute(`SELECT node_id, container_name FROM MODBUS_ADMIN.datakom_node_containers`);
+    for (const row of r.rows || []) out[String(row[0])] = String(row[1]);
+    return out;
+  } catch (e) {
+    console.warn('[DB] getDatakomNodeContainers failed:', e.message);
+    return out;
+  } finally {
+    await conn.close().catch(() => {});
+  }
+}
+
+// Assign a node to a container, or clear it when the name is empty/null.
+async function setDatakomNodeContainer(nodeId, container, userId = null) {
+  const conn = await getConnection();
+  if (!conn) return false;
+  try {
+    const clean = (container ?? '').toString().trim();
+    if (!clean) {
+      await conn.execute(
+        `DELETE FROM MODBUS_ADMIN.datakom_node_containers WHERE node_id = :nodeId`,
+        { nodeId }, { autoCommit: true }
+      );
+      return true;
+    }
+    const upd = await conn.execute(
+      `UPDATE MODBUS_ADMIN.datakom_node_containers
+          SET container_name = :name, updated_by = :userId, updated_at = SYSTIMESTAMP
+        WHERE node_id = :nodeId`,
+      { name: clean, userId, nodeId }, { autoCommit: false }
+    );
+    if ((upd.rowsAffected || 0) === 0) {
+      await conn.execute(
+        `INSERT INTO MODBUS_ADMIN.datakom_node_containers (node_id, container_name, updated_by)
+         VALUES (:nodeId, :name, :userId)`,
+        { nodeId, name: clean, userId }, { autoCommit: false }
+      );
+    }
+    await conn.commit();
+    return true;
+  } catch (e) {
+    await conn.rollback().catch(() => {});
+    console.warn('[DB] setDatakomNodeContainer failed:', e.message);
+    return false;
+  } finally {
+    await conn.close().catch(() => {});
+  }
+}
+
 // ── Page content overrides (admin visual editor) ──────────────────────────
 // Stores the frontend's <Editable> overrides as a single JSON blob so design
 // tweaks made by an admin are global — visible to every user on every device.
@@ -1390,6 +1473,9 @@ module.exports = {
   ensureDatakomNodeNamesTable,
   getDatakomNodeNames,
   setDatakomNodeName,
+  ensureDatakomNodeContainersTable,
+  getDatakomNodeContainers,
+  setDatakomNodeContainer,
   ensureProjectParentColumn,
   projectParentWouldCycle,
   oracledb,
