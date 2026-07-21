@@ -2046,7 +2046,9 @@ app.get('/api/brands/:brand/devices', authenticate, requireAnyPermission(['devic
 });
 
 // One device's latest reading. `:id` may be the brand's device id or its name.
-app.get('/api/brands/:brand/device/:id', authenticate, requireAnyPermission(['device.read', 'datakom.read']), (req, res) => {
+// fuel.read is accepted too: the Fuel pages read cloud fuel through this route,
+// and a fuel-only user must not see empty gauges for cloud-linked devices.
+app.get('/api/brands/:brand/device/:id', authenticate, requireAnyPermission(['device.read', 'datakom.read', 'fuel.read']), (req, res) => {
   const adapter = brandAdapters.getAdapter(req.params.brand);
   if (!adapter) return res.status(404).json({ error: `No data-source adapter for brand '${req.params.brand}'` });
   const data = adapter.getReading(req.params.id);

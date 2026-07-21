@@ -76,6 +76,9 @@ const PERMISSION_IMPLICATIONS = {
   'device.start':     ['device.read'],
   'device.stop':      ['device.read'],
   'fuel.read':        [],
+  // Live Datakom data includes the fuel level — a datakom-only viewer must
+  // not see devices with empty gauges.
+  'datakom.read':     ['fuel.read'],
   'project.write':    ['project.read'],
   'location.write':   ['location.read'],
   'settings.write':   ['settings.read'],

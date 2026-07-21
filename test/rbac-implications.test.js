@@ -41,6 +41,13 @@ test('fuel.read is satisfied by device.read', () => {
   assert.ok(keysSatisfying('fuel.read').includes('device.read'));
 });
 
+test('a datakom-only viewer can read fuel (datakom.read implies fuel.read)', () => {
+  const keys = keysSatisfying('fuel.read');
+  assert.ok(keys.includes('datakom.read'));
+  // and transitively datakom.write → datakom.read → fuel.read
+  assert.ok(keys.includes('datakom.write'));
+});
+
 test('every implication references only built-in permission keys', () => {
   for (const [strong, implied] of Object.entries(PERMISSION_IMPLICATIONS)) {
     assert.ok(BUILTIN_PERMISSION_KEYS.includes(strong), `${strong} is not a built-in key`);
