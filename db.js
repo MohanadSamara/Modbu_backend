@@ -831,6 +831,60 @@ async function setSnooze(deviceId, snoozeUntilMs, userId = null) {
   }
 }
 
+// ── Project containers (nested projects) ──────────────────────────────────
+// A project may live inside another project that acts as a container/folder.
+// The projects table pre-dates the app (comes from the DB dump), so add the
+// self-referencing parent_id column if it isn't there yet. ORA-01430 = column
+// already exists → ignore.
+async function ensureProjectParentColumn() {
+  const conn = await getConnection();
+  if (!conn) return;
+  try {
+    await conn.execute(`
+      BEGIN
+        EXECUTE IMMEDIATE 'ALTER TABLE MODBUS_ADMIN.projects ADD (parent_id NUMBER)';
+      EXCEPTION
+        WHEN OTHERS THEN IF SQLCODE != -1430 THEN RAISE; END IF;
+      END;
+    `);
+    console.log('[DB] projects.parent_id ready');
+  } catch (e) {
+    console.warn('[DB] ensureProjectParentColumn warning:', e.message);
+  } finally {
+    await conn.close().catch(() => {});
+  }
+}
+
+// Would setting project `id`'s parent to `parentId` create a cycle? True when
+// parentId is the project itself or any of its descendants. Walks up from the
+// proposed parent through parent_id links looking for `id`.
+async function projectParentWouldCycle(id, parentId) {
+  if (parentId == null) return false;
+  if (Number(parentId) === Number(id)) return true;
+  const conn = await getConnection();
+  if (!conn) return false;
+  try {
+    let cur = Number(parentId);
+    const seen = new Set();
+    while (cur != null && !seen.has(cur)) {
+      if (cur === Number(id)) return true;
+      seen.add(cur);
+      const r = await conn.execute(
+        `SELECT parent_id FROM MODBUS_ADMIN.projects WHERE id = :cur`,
+        { cur }, { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+      const row = (r.rows || [])[0];
+      cur = row && row.PARENT_ID != null ? Number(row.PARENT_ID) : null;
+    }
+    return false;
+  } catch (e) {
+    console.warn('[DB] projectParentWouldCycle failed:', e.message);
+    return false;
+  } finally {
+    await conn.close().catch(() => {});
+  }
+}
+
 // ── Datakom node name overrides ───────────────────────────────────────────
 // Datakom Rainbow node names come from the cloud portal and can't be renamed
 // there. This stores a per-node custom name shown INSTEAD of the cloud name,
@@ -1336,5 +1390,7 @@ module.exports = {
   ensureDatakomNodeNamesTable,
   getDatakomNodeNames,
   setDatakomNodeName,
+  ensureProjectParentColumn,
+  projectParentWouldCycle,
   oracledb,
 };

@@ -36,7 +36,7 @@ function targetFromReq(req) {
   return { deviceId, ip, port };
 }
 const oracledb = require('oracledb');
-const { initPool, closePool, getConnection, logDeviceAction, logFuelReading, getConsumptionRate, getFuelHistory, getEventTimes, checkFuelAlarms, ensureAlarmsTable, getActiveAlarms, acknowledgeAlarm, ensureSnoozeTable, getActiveSnoozes, setSnooze, ensureDatakomNodeNamesTable, getDatakomNodeNames, setDatakomNodeName, ensurePageContentTable, getPageContent, savePageContent, ensureSettingsTables, ensureRbacSeed, ensureUiElementCatalog } = require('./db');
+const { initPool, closePool, getConnection, logDeviceAction, logFuelReading, getConsumptionRate, getFuelHistory, getEventTimes, checkFuelAlarms, ensureAlarmsTable, getActiveAlarms, acknowledgeAlarm, ensureSnoozeTable, getActiveSnoozes, setSnooze, ensureDatakomNodeNamesTable, getDatakomNodeNames, setDatakomNodeName, ensureProjectParentColumn, projectParentWouldCycle, ensurePageContentTable, getPageContent, savePageContent, ensureSettingsTables, ensureRbacSeed, ensureUiElementCatalog } = require('./db');
 const { query, execute } = require('./db-helpers');
 const authRoutes  = require('./routes-auth');
 const userRoutes  = require('./routes-users');
@@ -1340,7 +1340,7 @@ app.get('/api/projects', authenticate, async (req, res) => {
     if (global) {
       const rows = await query(
         `SELECT p.ID, p.NAME, p.DESCRIPTION, p.CREATED_AT, p.UPDATED_AT,
-                p.BRAND_ID, p.METHOD, b.brand_name AS BRAND_NAME
+                p.BRAND_ID, p.METHOD, p.PARENT_ID, b.brand_name AS BRAND_NAME
            FROM MODBUS_ADMIN.projects p
            LEFT JOIN MODBUS_ADMIN.brands b ON b.brand_id = p.brand_id
           ORDER BY p.ID`);
@@ -1356,7 +1356,7 @@ app.get('/api/projects', authenticate, async (req, res) => {
 
     const rows = await query(
       `SELECT p.ID, p.NAME, p.DESCRIPTION, p.CREATED_AT, p.UPDATED_AT,
-              p.BRAND_ID, p.METHOD, b.brand_name AS BRAND_NAME
+              p.BRAND_ID, p.METHOD, p.PARENT_ID, b.brand_name AS BRAND_NAME
          FROM MODBUS_ADMIN.projects p
          LEFT JOIN MODBUS_ADMIN.brands b ON b.brand_id = p.brand_id
         WHERE p.ID IN (${names.join(', ')})
@@ -1368,8 +1368,10 @@ app.get('/api/projects', authenticate, async (req, res) => {
 });
 
 app.post('/api/projects', authenticate, requirePermission('project.write'), async (req, res) => {
-  const { name, description, brand_id, method } = req.body;
+  const { name, description, brand_id, method, parent_id } = req.body;
   if (!name || name.trim().length === 0) return res.status(400).json({ error: 'Name required' });
+  // Optional container: parent_id nests this project inside another.
+  const parentId = (parent_id === '' || parent_id === null || parent_id === undefined) ? null : parseInt(parent_id);
   // A project carries a brand + a connection METHOD ('cloud' = Datakom Rainbow,
   // 'ip' = Modbus TCP). The method drives the default connection type of devices
   // created under the project. If the caller doesn't send an explicit method, it
@@ -1386,8 +1388,8 @@ app.post('/api/projects', authenticate, requirePermission('project.write'), asyn
     }
     resolvedMethod = resolvedMethod || 'ip';
     await execute(
-      'INSERT INTO MODBUS_ADMIN.projects (name, description, brand_id, method) VALUES (:name, :description, :brand_id, :method)',
-      { name: name.trim(), description: description || null, brand_id: bId, method: resolvedMethod }
+      'INSERT INTO MODBUS_ADMIN.projects (name, description, brand_id, method, parent_id) VALUES (:name, :description, :brand_id, :method, :parent_id)',
+      { name: name.trim(), description: description || null, brand_id: bId, method: resolvedMethod, parent_id: parentId }
     );
     res.status(201).json({ success: true });
   } catch (e) {
@@ -1419,7 +1421,7 @@ app.get('/api/projects/:id', authenticate, requirePermission('project.read'), as
 app.put('/api/projects/:id', authenticate, requirePermission('project.write'), async (req, res) => {
   const id = parseInt(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid project ID' });
-  const { name, description, brand_id, method } = req.body;
+  const { name, description, brand_id, method, parent_id } = req.body;
   if (!name || name.trim().length === 0) return res.status(400).json({ error: 'Name required' });
   try {
     // Name/description always update. brand_id and method are optional — only
@@ -1433,6 +1435,16 @@ app.put('/api/projects/:id', authenticate, requirePermission('project.write'), a
     if (method === 'cloud' || method === 'ip') {
       sets.push('method = :method');
       binds.method = method;
+    }
+    // Container move: parent_id nests this project under another. Reject a move
+    // that would create a cycle (a project inside itself or its own descendant).
+    if (parent_id !== undefined) {
+      const parentId = (parent_id === '' || parent_id === null) ? null : parseInt(parent_id);
+      if (parentId != null && await projectParentWouldCycle(id, parentId)) {
+        return res.status(400).json({ error: 'A project cannot be placed inside itself or its own sub-project' });
+      }
+      sets.push('parent_id = :parent_id');
+      binds.parent_id = parentId;
     }
     const result = await execute(
       `UPDATE MODBUS_ADMIN.projects SET ${sets.join(', ')} WHERE id = :id`,
@@ -1459,6 +1471,12 @@ app.delete('/api/projects/:id', authenticate, requirePermission('project.write')
   if (!conn) return res.status(503).json({ error: 'DB unavailable' });
 
   try {
+    // If this project is a container, promote its child projects to top-level
+    // (parent_id = NULL) rather than orphaning them at a dangling parent.
+    await conn.execute(
+      'UPDATE MODBUS_ADMIN.projects SET parent_id = NULL WHERE parent_id = :id',
+      { id }
+    );
     const result = await conn.execute(
       'DELETE FROM MODBUS_ADMIN.projects WHERE id = :id',
       { id }
@@ -2575,6 +2593,8 @@ async function ensureAckTable() {
     await ensureSnoozeTable();
     // Custom names for Datakom cloud nodes (renamed locally, cloud untouched).
     await ensureDatakomNodeNamesTable();
+    // Allow a project to live inside another (container/folder nesting).
+    await ensureProjectParentColumn();
     // Auto-create the page_content table backing the admin visual page editor.
     await ensurePageContentTable();
     // Auto-create the system_settings + device_settings tables so the Settings
