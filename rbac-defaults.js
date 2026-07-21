@@ -66,6 +66,10 @@ const SYSTEM_ROLES = [
 // scope as the grant. Kept in sync with the frontend copy in
 // FrontEndModbus/.../src/config/uiElements.js (PERMISSION_IMPLICATIONS).
 const PERMISSION_IMPLICATIONS = {
+  // Viewing a device includes viewing its live data, whatever the transport —
+  // datakom.read is NOT a separate parallel permission to hand out; it exists
+  // only to grant cloud-data access on its own, without full device access.
+  'device.read':      ['datakom.read', 'fuel.read'],
   'device.write':     ['device.read'],
   'device.connect':   ['device.read'],
   'device.control':   ['device.read', 'fuel.read'],
@@ -81,13 +85,21 @@ const PERMISSION_IMPLICATIONS = {
 };
 
 // All permission keys that satisfy a check for `key` (the key itself plus any
-// stronger keys that imply it).
+// stronger keys that imply it, transitively — device.write → device.read →
+// datakom.read means device.write also satisfies datakom.read).
 function keysSatisfying(key) {
-  const out = [key];
-  for (const [strong, implied] of Object.entries(PERMISSION_IMPLICATIONS)) {
-    if (implied.includes(key)) out.push(strong);
+  const out = new Set([key]);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const [strong, implied] of Object.entries(PERMISSION_IMPLICATIONS)) {
+      if (!out.has(strong) && implied.some((k) => out.has(k))) {
+        out.add(strong);
+        grew = true;
+      }
+    }
   }
-  return out;
+  return [...out];
 }
 
 // Resolve a role's `permissions` field into a concrete list of permission keys.

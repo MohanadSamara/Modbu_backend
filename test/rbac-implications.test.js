@@ -29,6 +29,18 @@ test('fuel.read is satisfied by device.control', () => {
   assert.ok(keysSatisfying('fuel.read').includes('device.control'));
 });
 
+test('datakom.read behaves like device.read, not a separate copy', () => {
+  const keys = keysSatisfying('datakom.read');
+  assert.ok(keys.includes('device.read'), 'device.read should satisfy datakom.read');
+  // Transitive: device.write → device.read → datakom.read
+  assert.ok(keys.includes('device.write'), 'device.write should satisfy datakom.read (transitively)');
+  assert.ok(keys.includes('device.connect'), 'device.connect should satisfy datakom.read (transitively)');
+});
+
+test('fuel.read is satisfied by device.read', () => {
+  assert.ok(keysSatisfying('fuel.read').includes('device.read'));
+});
+
 test('every implication references only built-in permission keys', () => {
   for (const [strong, implied] of Object.entries(PERMISSION_IMPLICATIONS)) {
     assert.ok(BUILTIN_PERMISSION_KEYS.includes(strong), `${strong} is not a built-in key`);
