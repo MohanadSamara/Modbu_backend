@@ -1,0 +1,61 @@
+# Full production stack: Oracle XE + Node backend + Caddy (HTTPS + frontend).
+# Copy deploy/env.production.example to .env on the server and fill it in,
+# then: docker compose up -d --build
+services:
+  oracle:
+    image: gvenzl/oracle-xe:21
+    restart: unless-stopped
+    environment:
+      # SYS/SYSTEM password inside the container
+      ORACLE_PASSWORD: ${ORACLE_SYS_PASSWORD:?set ORACLE_SYS_PASSWORD in .env}
+      # Auto-create the app schema user on first start
+      APP_USER: MODBUS_ADMIN
+      APP_USER_PASSWORD: ${ORACLE_PASSWORD:?set ORACLE_PASSWORD in .env}
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+      # Drop your Data Pump export here to import it (see DEPLOY.md)
+      - ./deploy/db-dump:/dump
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 5m
+
+  backend:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Inside the compose network the DB is the "oracle" service — these
+      # override whatever is in .env so the same file works everywhere.
+      ORACLE_HOST: oracle
+      ORACLE_PORT: "1521"
+      ORACLE_SERVICE_NAME: XEPDB1
+      ORACLE_USER: MODBUS_ADMIN
+      PORT: "5400"
+      NODE_ENV: production
+    depends_on:
+      oracle:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy/www:/srv/www:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - backend
+
+volumes:
+  oracle-data:
+  caddy-data:
+  caddy-config:

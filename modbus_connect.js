@@ -22,12 +22,19 @@
 
 const ModbusRTU = require('modbus-serial');
 const { getConnection } = require('./db');
+const ops = require('./shared/modbus-registers'); // authoritative register map (shared with agent)
 require('dotenv').config();
 
 // ── Env defaults ──────────────────────────────────────────────────────────
 const DEFAULT_IP      = process.env.MODBUS_IP   || '192.168.1.20';
 const DEFAULT_PORT    = parseInt(process.env.MODBUS_PORT) || 502;
 const DEFAULT_TIMEOUT = 5000;
+// The initial TCP handshake must fail fast on a dead/unreachable device. The
+// CONNECTION_TIMEOUT system setting governs read/request timeouts and an admin
+// may legitimately set it high for slow links — we must NOT inherit that for
+// the connect attempt, or the endpoint hangs until the browser aborts and the
+// user just sees "request timed out". Bound the handshake to this ceiling.
+const CONNECT_TIMEOUT_CEILING = 8000;
 const RECONNECT_INTERVAL_MS = 10_000; // retry a dropped hub every 10 s
 
 // ── Hub registry ────────────────────────────────────────────────────────────
@@ -193,23 +200,32 @@ async function getDeviceConfig(deviceId = null) {
 
 // ── Raw TCP connect for a hub ───────────────────────────────────────────────
 async function rawConnect(hub) {
-  const timeoutMs = await getTimeoutMs();
+  // Cap the handshake so a dead device fails fast even when CONNECTION_TIMEOUT
+  // (a read/request setting) is configured high. See CONNECT_TIMEOUT_CEILING.
+  const timeoutMs = Math.min(await getTimeoutMs(), CONNECT_TIMEOUT_CEILING);
   console.log(`[Modbus] Connecting to ${hub.name} @ ${hub.ip}:${hub.port} (timeout ${timeoutMs}ms)…`);
+  let timer = null;
   try {
     if (hub.connected) { try { await hub.client.close(); } catch (_) {} hub.connected = false; }
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(
         `Connection timed out after ${timeoutMs}ms — device may be off or unreachable at ${hub.ip}:${hub.port}`
-      )), timeoutMs)
-    );
+      )), timeoutMs);
+    });
     await Promise.race([hub.client.connectTCP(hub.ip, { port: hub.port }), timeoutPromise]);
+    clearTimeout(timer);
     attachSocketListeners(hub);
     hub.connected = true;
     hub.connectedAt = new Date().toISOString();
     console.log(`[Modbus] ✓ Connected to ${hub.name} @ ${hub.ip}:${hub.port}`);
     return { ok: true };
   } catch (err) {
+    clearTimeout(timer);
     hub.connected = false;
+    // A timed-out handshake leaves a half-open socket still trying to connect in
+    // the background. Close it so the next attempt starts clean and sockets
+    // don't accumulate on repeated failures.
+    try { await hub.client.close(); } catch (_) {}
     let reason = err.message || 'Unknown error';
     if (/ECONNREFUSED/i.test(reason))            reason = `Connection refused — no Modbus listener at ${hub.ip}:${hub.port} (ECONNREFUSED)`;
     else if (/EHOSTUNREACH|ENETUNREACH/i.test(reason)) reason = `Host unreachable — check network/IP address (${reason})`;
@@ -337,9 +353,9 @@ async function readFuel(target = {}) {
   if (!hub || !hub.connected) { console.warn('[Modbus] Not connected (fuel)'); return null; }
   return withLock(hub, async () => {
     try {
-      const res  = await hub.client.readHoldingRegisters(10363, 1);
-      const fuel = res.data[0] / 10;
-      return fuel;
+      // Delegate to the shared register logic so the fuel scale + sentinel
+      // validation can never drift from the agent/telemetry paths.
+      return await ops.readFuel(hub.client);
     } catch (err) {
       console.error(`[Modbus] readFuel error (${hub.name}):`, err.message);
       hub.connected = false; scheduleReconnect(hub); return null;
@@ -397,6 +413,38 @@ async function readGps(target = {}) {
   });
 }
 
+// ── Generic raw register read (Modbus function 3) ───────────────────────────
+// Delegates the decode to the shared register map; this wrapper only adds the
+// per-hub lock + connection/reconnect handling.
+async function readRegisters(target = {}, start, count = 1) {
+  const hub = resolveHub(target);
+  if (!hub || !hub.connected) { console.warn('[Modbus] Not connected (readRegisters)'); return null; }
+  return withLock(hub, async () => {
+    try {
+      return await ops.readRegisters(hub.client, start, count);
+    } catch (err) {
+      console.error(`[Modbus] readRegisters error (${hub.name}):`, err.message);
+      hub.connected = false; scheduleReconnect(hub); return null;
+    }
+  });
+}
+
+// ── Combined telemetry snapshot (engine block + RPM + battery + GPS) ─────────
+// Delegates to the shared readTelemetry so the server and the remote agent
+// decode identical registers with identical coefficients.
+async function readTelemetry(target = {}) {
+  const hub = resolveHub(target);
+  if (!hub || !hub.connected) { console.warn('[Modbus] Not connected (telemetry)'); return null; }
+  return withLock(hub, async () => {
+    try {
+      return await ops.readTelemetry(hub.client);
+    } catch (err) {
+      console.error(`[Modbus] readTelemetry error (${hub.name}):`, err.message);
+      hub.connected = false; scheduleReconnect(hub); return null;
+    }
+  });
+}
+
 module.exports = {
   connectModbus,
   disconnectModbus,
@@ -408,4 +456,6 @@ module.exports = {
   startButton,
   readFuel,
   readGps,
+  readRegisters,
+  readTelemetry,
 };

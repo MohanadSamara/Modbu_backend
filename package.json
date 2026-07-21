@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test"
   },
   "keywords": [],
   "author": "",
@@ -21,6 +21,7 @@
     "jsonwebtoken": "^9.0.3",
     "modbus-serial": "^8.0.25",
     "nodemon": "^3.1.14",
-    "oracledb": "^6.10.0"
+    "oracledb": "^6.10.0",
+    "ws": "^8.21.0"
   }
 }

@@ -21,3 +21,15 @@ build/
 
 # Lock file (optional — keep if you want reproducible installs)
 # package-lock.json
+
+# Deployment artifacts (built frontend + DB dumps stay out of git)
+deploy/www/
+deploy/db-dump/
+s.out
+s.err
+
+# Local AI tooling config
+.claude/
+
+# Embedded design repo (local only)
+styleseed/

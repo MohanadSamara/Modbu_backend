@@ -120,6 +120,37 @@ function requireAnyPermission(permissionKeys) {
   };
 }
 
+/**
+ * Require `permissionKey`, but ONLY when `bodyField` is present in the request
+ * body. Lets a shared route carry a finer-grained gate for one field — e.g.
+ * editing a device needs device.write, but touching datakom_did (link/unlink a
+ * Datakom Rainbow device) additionally needs datakom.write. Chain it after the
+ * route's base guard: requirePermission('device.write'), then this. Assumes an
+ * earlier `authenticate` populated req.user.
+ */
+function requirePermissionIfBodyPresent(bodyField, permissionKey) {
+  return async (req, res, next) => {
+    if (req.body?.[bodyField] === undefined) return next(); // field not touched → no extra gate
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required', code: 'AUTH_MISSING' });
+    }
+    try {
+      const ok = await userHasPermission(req.user.id, permissionKey, _extractScope(req));
+      if (!ok) {
+        return res.status(403).json({
+          error: `Forbidden: missing permission ${permissionKey}`,
+          code: 'AUTH_FORBIDDEN',
+          requiredPermission: permissionKey,
+        });
+      }
+      next();
+    } catch (err) {
+      console.error('[Auth] requirePermissionIfBodyPresent error:', err.message);
+      res.status(500).json({ error: 'Permission check failed' });
+    }
+  };
+}
+
 // ============================================================================
 // Dynamic, data-driven enforcement.
 //
@@ -195,6 +226,7 @@ module.exports = {
   optionalAuthenticate,
   requirePermission,
   requireAnyPermission,
+  requirePermissionIfBodyPresent,
   enforceMappedPermissions,
   invalidateEndpointCache,
 };

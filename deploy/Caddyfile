@@ -1,0 +1,28 @@
+# Caddy gets a free HTTPS certificate automatically for {$DOMAIN}.
+# Everything is served from one origin, so the frontend's relative /api and
+# WebSocket paths work with no CORS setup.
+{$DOMAIN} {
+	encode gzip
+
+	# Backend API
+	handle /api/* {
+		reverse_proxy backend:5400
+	}
+
+	# Live telemetry WebSocket
+	handle /ws/* {
+		reverse_proxy backend:5400
+	}
+
+	# Site-agent reverse tunnel (agents connect to wss://DOMAIN/agent-tunnel)
+	handle /agent-tunnel {
+		reverse_proxy backend:5400
+	}
+
+	# React frontend (built files in deploy/www)
+	handle {
+		root * /srv/www
+		try_files {path} /index.html
+		file_server
+	}
+}

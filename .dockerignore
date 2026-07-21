@@ -1,0 +1,12 @@
+node_modules
+agent
+.git
+.claude
+.env
+.env.*
+s.out
+s.err
+deploy/www
+deploy/db-dump
+test
+*.md

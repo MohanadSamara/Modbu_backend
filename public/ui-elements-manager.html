@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="en" data-skin="technical">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UI Elements Manager - Modbus Admin</title>
+  <link rel="stylesheet" href="/styleseed/engine/core.css">
+  <style>
+    :root {
+      --accent: #0EA5E9;
+      --accent-hover: #0284C7;
+      --accent-light: #E0F2FE;
+      --danger: #EF4444;
+      --danger-hover: #DC2626;
+      --success: #10B981;
+      --bg: #0F172A;
+      --bg-elevated: #1E293B;
+      --bg-input: #334155;
+      --text: #F8FAFC;
+      --text-muted: #94A3B8;
+      --border: #334155;
+      --radius: 8px;
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 2rem;
+    }
+
+    /* Header */
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 2rem;
+      padding-bottom: 1.5rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .header h1 {
+      font-size: 1.875rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    .header-stats {
+      display: flex;
+      gap: 2rem;
+      font-size: 0.875rem;
+      color: var(--text-muted);
+    }
+
+    .stat-item {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+    }
+
+    .stat-value {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: var(--accent);
+    }
+
+    /* Toolbar */
+    .toolbar {
+      display: flex;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+      flex-wrap: wrap;
+    }
+
+    .search-box {
+      flex: 1;
+      min-width: 300px;
+      position: relative;
+    }
+
+    .search-box input {
+      width: 100%;
+      padding: 0.75rem 1rem 0.75rem 2.5rem;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-size: 0.875rem;
+      transition: all 0.2s;
+    }
+
+    .search-box input:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.1);
+    }
+
+    .search-icon {
+      position: absolute;
+      left: 0.75rem;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--text-muted);
+    }
+
+    .filter-group {
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    .filter-btn {
+      padding: 0.75rem 1rem;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text-muted);
+      font-size: 0.875rem;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .filter-btn:hover {
+      background: var(--bg-input);
+      color: var(--text);
+    }
+
+    .filter-btn.active {
+      background: var(--accent);
+      color: white;
+      border-color: var(--accent);
+    }
+
+    /* Buttons */
+    .btn {
+      padding: 0.75rem 1.5rem;
+      border: none;
+      border-radius: var(--radius);
+      font-size: 0.875rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: white;
+    }
+
+    .btn-primary:hover {
+      background: var(--accent-hover);
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(14, 165, 233, 0.3);
+    }
+
+    .btn-danger {
+      background: var(--danger);
+      color: white;
+    }
+
+    .btn-danger:hover {
+      background: var(--danger-hover);
+    }
+
+    .btn-secondary {
+      background: var(--bg-elevated);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+
+    .btn-secondary:hover {
+      background: var(--bg-input);
+    }
+
+    .btn-sm {
+      padding: 0.5rem 1rem;
+      font-size: 0.8125rem;
+    }
+
+    /* Table */
+    .table-container {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    thead {
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+    }
+
+    th {
+      padding: 1rem;
+      text-align: left;
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+    }
+
+    th.sortable {
+      cursor: pointer;
+      user-select: none;
+    }
+
+    th.sortable:hover {
+      color: var(--text);
+    }
+
+    td {
+      padding: 1rem;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.875rem;
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    tbody tr {
+      transition: background 0.15s;
+    }
+
+    tbody tr:hover {
+      background: rgba(14, 165, 233, 0.05);
+    }
+
+    .element-id {
+      font-family: 'Courier New', monospace;
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    .field-badge {
+      display: inline-block;
+      padding: 0.25rem 0.75rem;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+
+    .field-alarm { background: #FEE2E2; color: #991B1B; }
+    .field-device { background: #DBEAFE; color: #1E3A8A; }
+    .field-project { background: #FCE7F3; color: #831843; }
+    .field-location { background: #FEF3C7; color: #92400E; }
+    .field-user { background: #D1FAE5; color: #065F46; }
+    .field-settings { background: #E0E7FF; color: #3730A3; }
+    .field-fuel { background: #FED7AA; color: #9A3412; }
+    .field-audit { background: #F3E8FF; color: #5B21B6; }
+    .field-brand { background: #CCFBF1; color: #134E4A; }
+    .field-role { background: #FFE4E6; color: #881337; }
+    .field-permission { background: #FEF9C3; color: #713F12; }
+    .field-auth { background: #E0F2FE; color: #075985; }
+    .field-telemetry { background: #FBCFE8; color: #831843; }
+    .field-gps { background: #DBEAFE; color: #1E3A8A; }
+    .field-registers { background: #E0E7FF; color: #3730A3; }
+    .field-events { background: #FEE2E2; color: #991B1B; }
+
+    .actions {
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    /* Modal */
+    .modal {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.75);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+      backdrop-filter: blur(4px);
+    }
+
+    .modal.active {
+      display: flex;
+    }
+
+    .modal-content {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      width: 90%;
+      max-width: 600px;
+      max-height: 90vh;
+      overflow-y: auto;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+    }
+
+    .modal-header {
+      padding: 1.5rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .modal-header h2 {
+      font-size: 1.25rem;
+      font-weight: 700;
+    }
+
+    .modal-close {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-size: 1.5rem;
+      cursor: pointer;
+      padding: 0;
+      width: 2rem;
+      height: 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 4px;
+      transition: all 0.2s;
+    }
+
+    .modal-close:hover {
+      background: var(--bg-input);
+      color: var(--text);
+    }
+
+    .modal-body {
+      padding: 1.5rem;
+    }
+
+    .form-group {
+      margin-bottom: 1.5rem;
+    }
+
+    .form-group label {
+      display: block;
+      margin-bottom: 0.5rem;
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .form-group input,
+    .form-group select,
+    .form-group textarea {
+      width: 100%;
+      padding: 0.75rem;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-size: 0.875rem;
+      font-family: inherit;
+      transition: all 0.2s;
+    }
+
+    .form-group input:focus,
+    .form-group select:focus,
+    .form-group textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.1);
+    }
+
+    .form-group textarea {
+      resize: vertical;
+      min-height: 100px;
+    }
+
+    .form-hint {
+      margin-top: 0.25rem;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+
+    .modal-footer {
+      padding: 1.5rem;
+      border-top: 1px solid var(--border);
+      display: flex;
+      gap: 1rem;
+      justify-content: flex-end;
+    }
+
+    /* Toast Notifications */
+    .toast {
+      position: fixed;
+      bottom: 2rem;
+      right: 2rem;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1rem 1.5rem;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      min-width: 300px;
+      z-index: 2000;
+      animation: slideIn 0.3s ease;
+    }
+
+    @keyframes slideIn {
+      from {
+        transform: translateX(400px);
+        opacity: 0;
+      }
+      to {
+        transform: translateX(0);
+        opacity: 1;
+      }
+    }
+
+    .toast.success { border-left: 4px solid var(--success); }
+    .toast.error { border-left: 4px solid var(--danger); }
+
+    .toast-icon {
+      font-size: 1.25rem;
+    }
+
+    .toast-message {
+      flex: 1;
+      font-size: 0.875rem;
+    }
+
+    /* Loading State */
+    .loading {
+      text-align: center;
+      padding: 3rem;
+      color: var(--text-muted);
+    }
+
+    .spinner {
+      display: inline-block;
+      width: 2rem;
+      height: 2rem;
+      border: 3px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* Empty State */
+    .empty-state {
+      text-align: center;
+      padding: 4rem 2rem;
+      color: var(--text-muted);
+    }
+
+    .empty-state-icon {
+      font-size: 4rem;
+      margin-bottom: 1rem;
+      opacity: 0.3;
+    }
+
+    .empty-state h3 {
+      margin-bottom: 0.5rem;
+      color: var(--text);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <div class="header">
+      <div>
+        <h1>UI Elements Manager</h1>
+        <p style="color: var(--text-muted); margin-top: 0.5rem;">Manage all UI permissions and interface elements</p>
+      </div>
+      <div class="header-stats">
+        <div class="stat-item">
+          <span class="stat-value" id="totalCount">0</span>
+          <span>Total Elements</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-value" id="categoryCount">0</span>
+          <span>Categories</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="toolbar">
+      <div class="search-box">
+        <span class="search-icon">🔍</span>
+        <input type="text" id="searchInput" placeholder="Search by ID, field, or label...">
+      </div>
+      <div class="filter-group" id="filterButtons"></div>
+      <button class="btn btn-primary" onclick="openAddModal()">
+        ➕ Add New Element
+      </button>
+      <button class="btn btn-secondary" onclick="exportToCSV()">
+        📥 Export CSV
+      </button>
+    </div>
+
+    <!-- Table -->
+    <div class="table-container">
+      <table id="elementsTable">
+        <thead>
+          <tr>
+            <th class="sortable" onclick="sortTable('element_id')">Element ID ↕</th>
+            <th class="sortable" onclick="sortTable('field')">Field ↕</th>
+            <th class="sortable" onclick="sortTable('label')">Label ↕</th>
+            <th class="sortable" onclick="sortTable('sort_order')">Order ↕</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="tableBody">
+          <tr>
+            <td colspan="5">
+              <div class="loading">
+                <div class="spinner"></div>
+                <p style="margin-top: 1rem;">Loading UI elements...</p>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Add/Edit Modal -->
+  <div class="modal" id="elementModal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 id="modalTitle">Add UI Element</h2>
+        <button class="modal-close" onclick="closeModal()">×</button>
+      </div>
+      <div class="modal-body">
+        <form id="elementForm">
+          <div class="form-group">
+            <label for="elementId">Element ID *</label>
+            <input type="text" id="elementId" required placeholder="e.g., device.connect">
+            <div class="form-hint">Use format: category.action (lowercase, alphanumeric, dots, underscores)</div>
+          </div>
+
+          <div class="form-group">
+            <label for="field">Field (Category) *</label>
+            <select id="field" required>
+              <option value="">Select a category...</option>
+              <option value="auth">Authentication</option>
+              <option value="alarm">Alarms</option>
+              <option value="device">Devices</option>
+              <option value="project">Projects</option>
+              <option value="location">Locations</option>
+              <option value="settings">Settings</option>
+              <option value="fuel">Fuel Monitoring</option>
+              <option value="user">Users</option>
+              <option value="role">Roles</option>
+              <option value="permission">Permissions</option>
+              <option value="audit">Audit</option>
+              <option value="brand">Brands</option>
+              <option value="telemetry">Telemetry</option>
+              <option value="gps">GPS</option>
+              <option value="registers">Registers</option>
+              <option value="events">Events</option>
+              <option value="other">Other</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="label">Label *</label>
+            <input type="text" id="label" required placeholder="e.g., Connect / Disconnect button">
+            <div class="form-hint">Human-readable description of the UI element</div>
+          </div>
+
+          <div class="form-group">
+            <label for="sortOrder">Sort Order *</label>
+            <input type="number" id="sortOrder" required value="100" min="1" max="9999">
+            <div class="form-hint">Lower numbers appear first (1-9999)</div>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="saveElement()">
+          <span id="saveButtonText">Save Element</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete Confirmation Modal -->
+  <div class="modal" id="deleteModal">
+    <div class="modal-content" style="max-width: 400px;">
+      <div class="modal-header">
+        <h2>Confirm Delete</h2>
+        <button class="modal-close" onclick="closeDeleteModal()">×</button>
+      </div>
+      <div class="modal-body">
+        <p>Are you sure you want to delete this UI element?</p>
+        <p style="margin-top: 1rem; padding: 1rem; background: var(--bg); border-radius: 4px;">
+          <strong id="deleteElementId" style="color: var(--accent);"></strong>
+        </p>
+        <p style="margin-top: 1rem; color: var(--text-muted); font-size: 0.875rem;">
+          This action cannot be undone. The element will be removed from all permission mappings.
+        </p>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeDeleteModal()">Cancel</button>
+        <button class="btn btn-danger" onclick="confirmDelete()">Delete Element</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="ui-elements-manager.js"></script>
+</body>
+</html>

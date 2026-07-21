@@ -442,6 +442,29 @@ async function userHasAnyPermission(userId, permissionKeys, scope = null) {
       return `:perm${i}`;
     });
 
+    // When the caller supplies no target scope, this is a context-free check
+    // ("can this user do X anywhere?"): a grant in ANY scope — global OR scoped
+    // to any project/location/device — should satisfy it. This mirrors the
+    // frontend permission check (permScopeMatches with a null projectId) and the
+    // documented contract above. A specific target only NARROWS the match.
+    const contextFree =
+      eff.projectId == null && eff.locationId == null && eff.deviceId == null;
+
+    const scopeSql = contextFree ? '' : `
+          AND (
+                (ur.project_id IS NULL AND ur.location_id IS NULL AND ur.device_id IS NULL)
+             OR (ur.device_id   IS NOT NULL AND ur.device_id   = :deviceId)
+             OR (ur.location_id IS NOT NULL AND ur.location_id = :locationId)
+             OR (ur.project_id  IS NOT NULL AND ur.project_id  = :projectId)
+          )`;
+
+    const binds = { userId, ...permBinds };
+    if (!contextFree) {
+      binds.projectId  = eff.projectId  ?? null;
+      binds.locationId = eff.locationId ?? null;
+      binds.deviceId   = eff.deviceId   ?? null;
+    }
+
     const r = await conn.execute(
       `SELECT 1
          FROM MODBUS_ADMIN.user_roles       ur
@@ -450,21 +473,9 @@ async function userHasAnyPermission(userId, permissionKeys, scope = null) {
          JOIN MODBUS_ADMIN.users            u  ON u.user_id       = ur.user_id
         WHERE u.status          = 'active'
           AND ur.user_id        = :userId
-          AND p.permission_key IN (${placeholders.join(', ')})
-          AND (
-                (ur.project_id IS NULL AND ur.location_id IS NULL AND ur.device_id IS NULL)
-             OR (ur.device_id   IS NOT NULL AND ur.device_id   = :deviceId)
-             OR (ur.location_id IS NOT NULL AND ur.location_id = :locationId)
-             OR (ur.project_id  IS NOT NULL AND ur.project_id  = :projectId)
-          )
+          AND p.permission_key IN (${placeholders.join(', ')})${scopeSql}
           AND ROWNUM = 1`,
-      {
-        userId,
-        ...permBinds,
-        projectId:  eff.projectId  ?? null,
-        locationId: eff.locationId ?? null,
-        deviceId:   eff.deviceId   ?? null,
-      }
+      binds
     );
     const ok = (r.rows || []).length > 0;
     _permsCache.set(cacheKey, { ok, ts: Date.now() });

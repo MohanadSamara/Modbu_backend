@@ -7,8 +7,24 @@ let currentDeviceConfig = null;
 let currentDeviceId = null;
 let lastConnectAttemptAt = 0;
 
+// Device alarm snooze timestamps: { deviceId → snooze_until_ms }
+// Shared across all users/browsers so multiple users on the same device respect
+// each other's alarm accepts. This Map is a write-through cache in front of the
+// device_snoozes table — it is seeded from the DB at startup (loadSnoozes) and
+// every write also persists, so snoozes now survive a server restart.
+const deviceSnoozes = new Map();
+
 require('dotenv').config();
-const { connectModbus, disconnectModbus, closeAll, getSession, isConnected, stopButton, startButton, readFuel, readGps, getDeviceConfig } = require('./modbus_connect');
+// device-io is a thin facade over modbus_connect (direct TCP) + remote-hub
+// (reverse tunnel to site agents). Same function surface — a device is served
+// over the tunnel when an agent for it is connected, else via direct TCP.
+const { connectModbus, disconnectModbus, closeAll, getSession, isConnected, stopButton, startButton, readFuel, readGps, readRegisters, readTelemetry, getDeviceConfig } = require('./device-io');
+const remoteHub = require('./remote-hub');
+const telemetryWs = require('./telemetry-ws');
+const { bucketEvents } = require('./lib/telemetry-math');
+// Per-brand read-only data sources (e.g. Datakom Rainbow over WebSocket). Modbus
+// brands don't use this — they're read via device-io. See brand-adapters.js.
+const brandAdapters = require('./brand-adapters');
 
 // Build a per-device target ({ deviceId | ip, port }) from request query params.
 // Every read/write op is addressed to a specific device's connection so two
@@ -20,11 +36,11 @@ function targetFromReq(req) {
   return { deviceId, ip, port };
 }
 const oracledb = require('oracledb');
-const { initPool, closePool, getConnection, logDeviceAction, logFuelReading, getConsumptionRate, checkFuelAlarms } = require('./db');
+const { initPool, closePool, getConnection, logDeviceAction, logFuelReading, getConsumptionRate, getFuelHistory, getEventTimes, checkFuelAlarms, ensureAlarmsTable, getActiveAlarms, acknowledgeAlarm, ensureSnoozeTable, getActiveSnoozes, setSnooze, ensurePageContentTable, getPageContent, savePageContent, ensureSettingsTables, ensureRbacSeed, ensureUiElementCatalog } = require('./db');
 const { query, execute } = require('./db-helpers');
 const authRoutes  = require('./routes-auth');
 const userRoutes  = require('./routes-users');
-const { authenticate, requirePermission, requireAnyPermission, optionalAuthenticate, enforceMappedPermissions } = require('./middleware');
+const { authenticate, requirePermission, requireAnyPermission, requirePermissionIfBodyPresent, optionalAuthenticate, enforceMappedPermissions } = require('./middleware');
 const { visibleProjects, visibleLocationIds, filterVisibleDevices } = require('./nav-scope');
 const cors = require('cors');
 const app = express();
@@ -41,6 +57,9 @@ const _allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:5173,http
 app.use(cors({ origin: _allowedOrigins }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Serve static files from public directory
+app.use(express.static('public'));
 
 // Data-driven authorization: enforce admin-defined permission→endpoint mappings
 // on top of the built-in route guards. Runs after body parsing so it can read
@@ -159,7 +178,7 @@ async function menuAddDevice() {
   const name = await ask('Name: ');
   const ip = await ask('IP: ');
   const port = parseInt(await ask('Port: ') || '502');
-  const status = await ask('Status: ') || 'online';
+  const status = await ask('Status: ') || 'offline';
   const conn = await getConnection();
   if (conn) {
     try {
@@ -202,26 +221,93 @@ async function startCLI() {
 //                user creation is admin-only via /api/users)
 // /api/users/* : admin user CRUD, role assignment
 // /api/roles, /api/permissions, /api/audit  (also under userRoutes)
+// Unauthenticated health probe — the frontend header pill polls this to show
+// live backend reachability. Must be registered BEFORE the /api routers,
+// whose router-level authenticate would otherwise 401 it. Exposes nothing
+// beyond liveness.
+app.get('/api/health', (_, res) => res.json({ ok: true, uptime: Math.floor(process.uptime()) }));
+
 app.use('/api/auth', authRoutes);
 app.use('/api',      userRoutes);
 
 // API
-app.get('/', (_, res) => res.json({ ready: true }));
+// The root path intentionally has no route: when deploy/www exists it serves
+// the hosted frontend (see the block near the bottom of this file); health
+// probes use /api/health above.
 
 // ── Session endpoint — returns current Modbus connection state ────────────
 // The frontend calls this on every Projects tab mount to restore UI state
 // without triggering a new TCP connect.
 app.get('/api/modbus/session', authenticate, requirePermission('device.read'), (_, res) => {
-  res.json(getSession());
+  const session = getSession();
+
+  // Inject Datakom Rainbow connections into the devices list so the health
+  // dashboard's "Device Connections" section shows them alongside Modbus devices.
+  const dkAdapter = brandAdapters.getAdapter('datakom');
+  if (dkAdapter?.isReady?.()) {
+    const existingIds = new Set(
+      session.devices.map((d) => (d.deviceId != null ? Number(d.deviceId) : null))
+    );
+    for (const [did, devId] of _didToDeviceId) {
+      const r = dkAdapter.getReading(did);
+      if (r?.reading && !existingIds.has(devId)) {
+        session.devices.push({
+          connected: true,
+          deviceId:  devId,
+          method:    'datakom-rainbow',
+          did,
+          readAt:    r.reading.readAt,
+        });
+        existingIds.add(devId);
+      }
+    }
+    if (!session.connected && session.devices.some((d) => d.connected)) {
+      session.connected = true;
+    }
+  }
+
+  res.json(session);
 });
 
-app.get('/api/registers', authenticate, requirePermission('device.read'), async (_, res) => {
-  // Stub for registers - extend with real Modbus read if needed
-  res.json([
-    { id: '40001', name: 'Fuel Level', value: 75, type: 'holding', timestamp: new Date().toISOString() },
-    { id: '40002', name: 'Temperature', value: 23.5, type: 'holding', timestamp: new Date().toISOString() },
-    { id: '40003', name: 'Pressure', value: 1.2, type: 'holding', timestamp: new Date().toISOString() }
-  ]);
+// Real register snapshot for a connected device. Replaces the old hardcoded
+// stub: reads live fuel + GPS off the device and returns them in the
+// register-list shape the frontend expects. Requires ?device_id= (or ?ip=)
+// and an active connection, mirroring /api/modbus/fuel.
+app.get('/api/registers', authenticate, requirePermission('device.read'), async (req, res) => {
+  const target = targetFromReq(req);
+  if (!isConnected(target)) {
+    return res.status(503).json({
+      error: 'Modbus device unavailable',
+      detail: 'No active connection to this device. Connect it to read registers.',
+      code: 'MODBUS_UNAVAILABLE',
+    });
+  }
+  try {
+    const t = await readTelemetry(target);
+    if (!t) return res.status(502).json({ error: 'Register read failed', code: 'MODBUS_READ_FAILED' });
+    const ts = t.readAt || new Date().toISOString();
+    // Engine/analog block + RPM + battery (manual p.13), then GPS (p.14).
+    const registers = [
+      { id: '10361', name: 'Oil Pressure',    value: t.oilPressure,    unit: 'bar', type: 'holding', timestamp: ts },
+      { id: '10362', name: 'Engine Temp',     value: t.engineTemp,     unit: '°C',  type: 'holding', timestamp: ts },
+      { id: '10363', name: 'Fuel Level',      value: t.fuel,           unit: '%',   type: 'holding', timestamp: ts },
+      { id: '10364', name: 'Oil Temp',        value: t.oilTemp,        unit: '°C',  type: 'holding', timestamp: ts },
+      { id: '10365', name: 'Canopy Temp',     value: t.canopyTemp,     unit: '°C',  type: 'holding', timestamp: ts },
+      { id: '10366', name: 'Ambient Temp',    value: t.ambientTemp,    unit: '°C',  type: 'holding', timestamp: ts },
+      { id: '10376', name: 'Engine RPM',      value: t.rpm,            unit: 'rpm', type: 'holding', timestamp: ts },
+      { id: '10385', name: 'Battery Voltage', value: t.batteryVoltage, unit: 'V',   type: 'holding', timestamp: ts },
+    ];
+    if (t.gps) {
+      registers.push(
+        { id: '10594', name: 'Latitude',  value: t.gps.latitude,  unit: '°', type: 'holding', timestamp: ts },
+        { id: '10596', name: 'Longitude', value: t.gps.longitude, unit: '°', type: 'holding', timestamp: ts },
+        { id: '10598', name: 'Altitude',  value: t.gps.altitude,  unit: 'm', type: 'holding', timestamp: ts },
+      );
+    }
+    res.json(registers);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/api/events', authenticate, requirePermission('alarm.read'), async (_, res) => {
@@ -241,14 +327,37 @@ const r = await conn.execute('SELECT * FROM MODBUS_ADMIN.device_actions ORDER BY
   }
 });
 
+// Real activity stats for charts. Buckets device_readings ("packets") and
+// ALARM_* device_actions ("errors") over the requested period. Replaces the
+// old hardcoded three-point stub.
+//   ?period=1h|6h|24h|7d|30d   ?device_id=<n> (optional scope to one device)
+const STATS_PERIODS = {
+  '1h':  { spanMs: 60 * 60_000,            buckets: 12 },
+  '6h':  { spanMs: 6 * 60 * 60_000,        buckets: 12 },
+  '24h': { spanMs: 24 * 60 * 60_000,       buckets: 24 },
+  '7d':  { spanMs: 7 * 24 * 60 * 60_000,   buckets: 14 },
+  '30d': { spanMs: 30 * 24 * 60 * 60_000,  buckets: 30 },
+};
+
 app.get('/api/stats', authenticate, requirePermission('device.read'), async (req, res) => {
-  // Stub stats for charts
-  const period = req.query.period || '24h';
-  res.json([
-    { timestamp: new Date(Date.now() - 24*60*60*1000).toISOString(), packets: 1250, errors: 5 },
-    { timestamp: new Date(Date.now() - 12*60*60*1000).toISOString(), packets: 2450, errors: 2 },
-    { timestamp: new Date().toISOString(), packets: 3800, errors: 1 }
-  ]);
+  const period = STATS_PERIODS[req.query.period] ? req.query.period : '24h';
+  const { spanMs, buckets } = STATS_PERIODS[period];
+  const deviceId = req.query.device_id ? parseInt(req.query.device_id) : null;
+  try {
+    const windowMinutes = Math.ceil(spanMs / 60_000);
+    const { readings, alarms } = await getEventTimes(windowMinutes, deviceId);
+    const now = Date.now();
+    const events = [
+      ...readings.map((t) => ({ t, kind: 'packet' })),
+      ...alarms.map((t) => ({ t, kind: 'error' })),
+    ];
+    const series = bucketEvents(events, { now, spanMs, buckets, errorKind: 'error' })
+      .map((b) => ({ timestamp: b.timestamp, packets: b.total - b.errors, errors: b.errors }));
+    res.json(series);
+  } catch (e) {
+    console.error('GET /api/stats error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Note: The /api/devices route with filters is defined below. This route handles both:
@@ -468,6 +577,7 @@ async function getEffectiveThresholds(deviceId) {
     criticalTank:    parseFloat(SETTING_DEFAULTS.CRITICAL_TANK_THRESHOLD.value),
     consumptionRate: parseFloat(SETTING_DEFAULTS.CONSUMPTION_RATE_THRESHOLD.value),
     alertsEnabled:   SETTING_DEFAULTS.FUEL_ALERTS_ENABLED.value === 'true',
+    cooldownMinutes: parseFloat(SETTING_DEFAULTS.ALARM_COOLDOWN_MINUTES.value),
   };
 
   const conn = await getConnection();
@@ -481,7 +591,7 @@ async function getEffectiveThresholds(deviceId) {
     const sysRes = await conn.execute(
       `SELECT setting_key, setting_value, setting_type
          FROM MODBUS_ADMIN.system_settings
-        WHERE setting_key IN ('LOW_TANK_THRESHOLD','CRITICAL_TANK_THRESHOLD','CONSUMPTION_RATE_THRESHOLD','FUEL_ALERTS_ENABLED')`
+        WHERE setting_key IN ('LOW_TANK_THRESHOLD','CRITICAL_TANK_THRESHOLD','CONSUMPTION_RATE_THRESHOLD','FUEL_ALERTS_ENABLED','ALARM_COOLDOWN_MINUTES')`
     );
     for (const row of sysRes.rows || []) {
       const k = row[0], v = row[1];
@@ -489,6 +599,7 @@ async function getEffectiveThresholds(deviceId) {
       else if (k === 'CRITICAL_TANK_THRESHOLD')   defaults.criticalTank    = parseFloat(v);
       else if (k === 'CONSUMPTION_RATE_THRESHOLD') defaults.consumptionRate = parseFloat(v);
       else if (k === 'FUEL_ALERTS_ENABLED')       defaults.alertsEnabled   = v === 'true';
+      else if (k === 'ALARM_COOLDOWN_MINUTES')    defaults.cooldownMinutes = parseFloat(v);
     }
 
     // Per-device overrides take precedence
@@ -506,6 +617,7 @@ async function getEffectiveThresholds(deviceId) {
         else if (k === 'CRITICAL_TANK_THRESHOLD')   defaults.criticalTank    = parseFloat(v);
         else if (k === 'CONSUMPTION_RATE_THRESHOLD') defaults.consumptionRate = parseFloat(v);
         else if (k === 'FUEL_ALERTS_ENABLED')       defaults.alertsEnabled   = v === 'true';
+        else if (k === 'ALARM_COOLDOWN_MINUTES')    defaults.cooldownMinutes = parseFloat(v);
       }
     }
   } catch (e) {
@@ -532,6 +644,10 @@ const _lastAlarmInfo = new Map();   // deviceId -> { triggered, consumption, ts 
 let _bgInflight = new Map();        // deviceId -> Promise (dedup background work)
 
 function _backgroundFuelWork(deviceId, fuelValue) {
+  // No usable reading (sensor unavailable / sentinel decoded to null). Skip so
+  // we neither persist a bogus sample nor evaluate alarms against a non-value.
+  if (typeof fuelValue !== 'number' || !Number.isFinite(fuelValue)) return;
+
   // Coalesce: if we're already running a background pass for this device,
   // don't queue another one — the in-flight one will pick up the new value
   // on its next iteration via the most recent log.
@@ -547,11 +663,21 @@ function _backgroundFuelWork(deviceId, fuelValue) {
         getEffectiveThresholds(deviceId),
       ]);
 
-      const info = await checkFuelAlarms(deviceId, fuelValue, thresholds);
+      const info = await checkFuelAlarms(deviceId, fuelValue, thresholds, {
+        cooldownMinutes: thresholds.cooldownMinutes,
+      });
       _lastAlarmInfo.set(deviceId, {
         triggered:   info.triggered || [],
         consumption: info.consumption || null,
         ts:          Date.now(),
+      });
+      // Push the refreshed alarm/consumption snapshot to live subscribers.
+      telemetryWs.broadcastTelemetry(deviceId, {
+        fuel:            fuelValue,
+        consumptionRate: info.consumption ? info.consumption.ratePerHour : null,
+        consumption:     info.consumption || null,
+        alarms:          info.triggered   || [],
+        at:              new Date().toISOString(),
       });
     } catch (err) {
       console.error('[Fuel] background work error:', err.message);
@@ -561,6 +687,50 @@ function _backgroundFuelWork(deviceId, fuelValue) {
   })();
 
   _bgInflight.set(deviceId, p);
+}
+
+// ── Live telemetry poll loop ───────────────────────────────────────────────
+// Continuously reads every connected device and pushes fresh fuel/consumption/
+// alarm frames to WebSocket subscribers, so browsers get live updates WITHOUT
+// polling REST. One read serves every viewer. It self-gates two ways to avoid
+// needless Modbus traffic:
+//   • skips entirely when no browser is listening (clientCount === 0)
+//   • never overlaps a slow tick with the next (_telemetryPolling guard)
+// _backgroundFuelWork() does the logging, threshold/alarm evaluation and the
+// broadcast — the same path the /api/modbus/fuel route uses — so live-pushed
+// data is identical to a REST read.
+const TELEMETRY_POLL_MS = Math.max(1000, Number(process.env.TELEMETRY_POLL_MS) || 2000);
+let _telemetryPolling = false;
+
+async function telemetryPollTick() {
+  if (_telemetryPolling) return;                 // previous tick still running
+  if (telemetryWs.clientCount() === 0) return;   // nobody listening
+  _telemetryPolling = true;
+  try {
+    const connected = getSession().devices.filter((d) => d.connected && d.deviceId != null);
+    await Promise.all(
+      connected.map(async (d) => {
+        const deviceId = Number(d.deviceId);
+        try {
+          const f = await readFuel({ deviceId });
+          if (typeof f === 'number' && Number.isFinite(f)) {
+            _backgroundFuelWork(deviceId, f);    // logs, evaluates alarms, broadcasts
+          } else {
+            // No usable reading — mirror the "unavailable" state so live clients
+            // agree with what a REST read would have returned.
+            telemetryWs.broadcastTelemetry(deviceId, {
+              fuel: null, reading: 'unavailable', alarms: [], at: new Date().toISOString(),
+            });
+          }
+        } catch (_) {
+          // Transient read error — the hub flips itself to disconnected and
+          // schedules a reconnect. Nothing to push this tick.
+        }
+      })
+    );
+  } finally {
+    _telemetryPolling = false;
+  }
 }
 
 app.get('/api/modbus/fuel', authenticate, requirePermission('fuel.read'), async (req, res) => {
@@ -579,10 +749,35 @@ app.get('/api/modbus/fuel', authenticate, requirePermission('fuel.read'), async 
     // Hot path: only the Modbus read is awaited.
     const f = await readFuel(target);
     if (f === null || f === undefined) {
-      return res.status(502).json({
-        error: 'Fuel read failed',
-        code: 'MODBUS_READ_FAILED'
+      // A null reading covers two very different situations:
+      //   • the read threw (socket dropped) — readFuel flips the hub to
+      //     disconnected and schedules a reconnect. Report a transient 502 so
+      //     the client keeps its last value and retries.
+      //   • the device is still connected but the tank sensor has no usable
+      //     value (e.g. the 0x7FFF "unavailable" sentinel). That is a steady,
+      //     expected state — not an error. Return 200 with fuel:null so the UI
+      //     shows a calm "No reading" instead of a red error every few seconds.
+      if (!isConnected(target)) {
+        return res.status(502).json({
+          error: 'Fuel read failed',
+          code: 'MODBUS_READ_FAILED'
+        });
+      }
+      const noSnap = target.deviceId ? _lastAlarmInfo.get(target.deviceId) : null;
+      res.json({
+        fuel:            null,
+        reading:         'unavailable',
+        consumptionRate: null,
+        consumption:     noSnap?.consumption || null,
+        alarms:          [],
       });
+      // Mirror the no-reading state to live subscribers so WS clients agree.
+      if (target.deviceId) {
+        telemetryWs.broadcastTelemetry(target.deviceId, {
+          fuel: null, reading: 'unavailable', alarms: [], at: new Date().toISOString(),
+        });
+      }
+      return;
     }
 
     // Pull the most recent alarm/consumption snapshot computed by the
@@ -595,6 +790,18 @@ app.get('/api/modbus/fuel', authenticate, requirePermission('fuel.read'), async 
       consumption:     snap?.consumption || null,
       alarms:          snap?.triggered   || [],
     });
+
+    // Push the fresh fuel value to live subscribers immediately (alarms follow
+    // from the background pass below).
+    if (target.deviceId) {
+      telemetryWs.broadcastTelemetry(target.deviceId, {
+        fuel:            f,
+        consumptionRate: snap?.consumption ? snap.consumption.ratePerHour : null,
+        consumption:     snap?.consumption || null,
+        alarms:          snap?.triggered   || [],
+        at:              new Date().toISOString(),
+      });
+    }
 
     // Fire-and-forget: persist + alarm check happen after response is sent.
     if (target.deviceId) {
@@ -620,6 +827,73 @@ async function setDeviceStatus(deviceId, status) {
   } catch (e) {
     console.warn(`[Status] update failed for device ${deviceId}:`, e.message);
   }
+}
+
+// ── Live status reconciliation ───────────────────────────────────────────────
+// The persisted `status` column is only written 'online' on a successful connect
+// and 'offline' on an *explicit* user disconnect. It is NOT updated when a socket
+// silently drops, when an agent tunnel closes, or across a server restart — and
+// new devices default to 'online' — so a stored 'online' is often stale.
+//
+// The authoritative "connected right now" signal is the live hub/agent registry
+// (getSession, covering both direct-TCP and remote-agent devices). Reconcile
+// every device list against it before returning:
+//   • connected right now              → 'online'
+//   • stored 'online' but no live link  → 'offline'  (stale write)
+//   • stored 'offline' / 'shutdown'     → left unchanged
+
+// Cache: Datakom did(number) → platform device_id. Built at startup and refreshed
+// after any device create/update, so connectedDeviceIds() can resolve Rainbow
+// connections to platform IDs without a synchronous DB query.
+const _didToDeviceId = new Map();
+async function refreshDidMap() {
+  try {
+    const result = await query(
+      `SELECT device_id, datakom_did FROM MODBUS_ADMIN.devices WHERE datakom_did IS NOT NULL`
+    );
+    _didToDeviceId.clear();
+    for (const r of (result.rows || [])) {
+      const did   = Number(r.DATAKOM_DID  ?? r.datakom_did);
+      const devId = Number(r.DEVICE_ID    ?? r.device_id);
+      if (Number.isFinite(did) && Number.isFinite(devId)) _didToDeviceId.set(did, devId);
+    }
+  } catch (_) { /* non-fatal — map stays with last good values */ }
+}
+
+function connectedDeviceIds() {
+  const ids = new Set();
+  try {
+    for (const d of getSession().devices) {
+      if (d.connected && d.deviceId != null) ids.add(Number(d.deviceId));
+    }
+  } catch { /* session not ready — treat as nothing connected */ }
+  // Also count devices live via Datakom Rainbow as connected.
+  const dkAdapter = brandAdapters.getAdapter('datakom');
+  if (dkAdapter?.isReady?.()) {
+    for (const did of dkAdapter.connectedDids()) {
+      const devId = _didToDeviceId.get(did);
+      if (devId != null) ids.add(devId);
+    }
+  }
+  return ids;
+}
+
+function effectiveStatus(deviceId, stored, connectedIds) {
+  if (connectedIds.has(Number(deviceId))) return 'online';
+  const s = String(stored ?? 'offline').toLowerCase();
+  return s === 'online' ? 'offline' : s;
+}
+
+// Rewrite the STATUS field of query() row objects in place (Oracle upper-cases
+// unaliased columns, so the key is STATUS; tolerate a lowercase `status` too).
+function reconcileDeviceRows(rows) {
+  const connectedIds = connectedDeviceIds();
+  for (const r of rows) {
+    const id  = r.ID ?? r.id;
+    const eff = effectiveStatus(id, r.STATUS ?? r.status, connectedIds);
+    if ('STATUS' in r) r.STATUS = eff; else r.status = eff;
+  }
+  return rows;
 }
 
 // ── GPS position ────────────────────────────────────────────────────────────
@@ -674,6 +948,109 @@ app.get('/api/modbus/gps', authenticate, requirePermission('device.read'), async
   }
 });
 
+// ── Combined telemetry snapshot ───────────────────────────────────────────
+// One call returns live fuel + GPS + the most-recent alarm/consumption snapshot
+// for a connected device. Cheaper than calling /fuel and /gps separately.
+app.get('/api/modbus/telemetry', authenticate, requirePermission('device.read'), async (req, res) => {
+  const target = targetFromReq(req);
+  if (!isConnected(target)) {
+    return res.status(503).json({
+      error: 'Modbus device unavailable',
+      detail: 'No active connection to this device.',
+      code: 'MODBUS_UNAVAILABLE',
+    });
+  }
+  try {
+    const t = await readTelemetry(target);
+    if (!t) return res.status(502).json({ error: 'Telemetry read failed', code: 'MODBUS_READ_FAILED' });
+
+    // Persist GPS so the map stays fresh (same as /gps), fire-and-forget.
+    if (target.deviceId && t.gps) persistDeviceGps(target.deviceId, t.gps);
+
+    const snap = target.deviceId ? _lastAlarmInfo.get(target.deviceId) : null;
+    // Engine/analog fields decoded from the shared register map.
+    const engine = {
+      oilPressure:    t.oilPressure    ?? null,
+      engineTemp:     t.engineTemp     ?? null,
+      oilTemp:        t.oilTemp        ?? null,
+      canopyTemp:     t.canopyTemp     ?? null,
+      ambientTemp:    t.ambientTemp    ?? null,
+      rpm:            t.rpm            ?? null,
+      batteryVoltage: t.batteryVoltage ?? null,
+    };
+    const payload = {
+      deviceId:        target.deviceId ?? null,
+      fuel:            t.fuel,
+      ...engine,
+      gps:             t.gps,
+      consumptionRate: snap?.consumption ? snap.consumption.ratePerHour : null,
+      consumption:     snap?.consumption || null,
+      alarms:          snap?.triggered   || [],
+      readAt:          t.readAt,
+    };
+    res.json(payload);
+
+    // Push the full engine+GPS snapshot to live WebSocket subscribers.
+    if (target.deviceId) {
+      telemetryWs.broadcastTelemetry(target.deviceId, {
+        fuel: t.fuel, ...engine, gps: t.gps, at: t.readAt,
+      });
+      // Feed the same background pipeline as /fuel (persist + alarm eval + push).
+      _backgroundFuelWork(target.deviceId, t.fuel);
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Raw holding-register read (Modbus function 3) ─────────────────────────
+// Engineer tool: read any register block off a connected device.
+//   GET /api/modbus/registers/read?device_id=1&start=10363&count=1
+app.get('/api/modbus/registers/read', authenticate, requirePermission('device.read'), async (req, res) => {
+  const target = targetFromReq(req);
+  const start  = parseInt(req.query.start);
+  const count  = req.query.count ? parseInt(req.query.count) : 1;
+  if (!Number.isInteger(start) || start < 0) {
+    return res.status(400).json({ error: 'Provide a valid start register (?start=)' });
+  }
+  if (!Number.isInteger(count) || count < 1 || count > 125) {
+    return res.status(400).json({ error: 'count must be between 1 and 125' });
+  }
+  if (!isConnected(target)) {
+    return res.status(503).json({
+      error: 'Modbus device unavailable',
+      detail: 'No active connection to this device.',
+      code: 'MODBUS_UNAVAILABLE',
+    });
+  }
+  try {
+    const result = await readRegisters(target, start, count);
+    if (!result) return res.status(502).json({ error: 'Register read failed', code: 'MODBUS_READ_FAILED' });
+    res.json({ ...result, readAt: new Date().toISOString() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Fuel history (for charts) ─────────────────────────────────────────────
+// Returns raw FUEL samples for a device over the last ?window minutes (default
+// 24h), oldest first, capped by ?limit (default 500). Reads from device_readings
+// — no live Modbus connection required.
+app.get('/api/fuel-history/:deviceId', authenticate, requirePermission('fuel.read'), async (req, res) => {
+  const deviceId = parseInt(req.params.deviceId);
+  if (!Number.isInteger(deviceId) || deviceId <= 0) {
+    return res.status(400).json({ error: 'Invalid device ID' });
+  }
+  const windowMinutes = Math.max(1, Math.min(parseInt(req.query.window) || 1440, 43_200)); // ≤ 30d
+  const limit         = parseInt(req.query.limit) || 500;
+  try {
+    const history = await getFuelHistory(deviceId, windowMinutes, limit);
+    res.json({ deviceId, windowMinutes, count: history.length, history });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Consumption rate endpoint ─────────────────────────────────────────────
 app.get('/api/consumption-rate/:deviceId', authenticate, requirePermission('fuel.read'), async (req, res) => {
   const deviceId = parseInt(req.params.deviceId);
@@ -697,38 +1074,251 @@ app.get('/api/consumption-rate/:deviceId', authenticate, requirePermission('fuel
 });
 
 // ── Recent alarms endpoint ────────────────────────────────────────────────
+// Reads the dedicated MODBUS_ADMIN.alarms table (every triggered alarm is saved
+// there), returning only UN-acknowledged rows. A row disappears as soon as the
+// user accepts it (POST /api/alarms/:id/acknowledge). Because checkFuelAlarms
+// uses a 5-min cooldown, a new alarm row appears after that cooldown if the
+// device is still in an alarm condition — giving the "temporary dismiss" behaviour.
 app.get('/api/alarms', authenticate, requirePermission('alarm.read'), async (req, res) => {
   const deviceId = req.query.device_id ? parseInt(req.query.device_id) : null;
   const limit    = Math.min(parseInt(req.query.limit) || 50, 500);
-  const conn = await getConnection();
-  if (!conn) return res.json([]);
   try {
-    const binds = {};
-    let where = "WHERE action_type LIKE 'ALARM_%'";
-    if (deviceId) {
-      where += ' AND device_id = :deviceId';
-      binds.deviceId = deviceId;
-    }
-    const sql =
-      `SELECT * FROM (
-         SELECT action_id, device_id, action_type, action_time
-           FROM MODBUS_ADMIN.device_actions
-           ${where}
-         ORDER BY action_time DESC
-       ) WHERE ROWNUM <= ${limit}`;
-    const r = await conn.execute(sql, binds);
-    res.json((r.rows || []).map(row => ({
-      id:       row[0],
-      deviceId: row[1],
-      type:     row[2],
-      time:     row[3],
-      severity: row[2] === 'ALARM_CRITICAL_FUEL' ? 'critical' : 'warning',
-    })));
+    const rows = await getActiveAlarms({ deviceId, limit });
+    res.json(rows);
   } catch (e) {
     console.error('GET /api/alarms error:', e.message);
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Acknowledge a specific alarm ─────────────────────────────────────────
+// Marks the alarm row acknowledged in MODBUS_ADMIN.alarms so GET /api/alarms
+// hides it. Idempotent: acknowledging the same alarm twice is a no-op.
+// A NEW alarm row appears if checkFuelAlarms fires again for the same device
+// after the cooldown period (currently 5 min).
+app.post('/api/alarms/:id/acknowledge', authenticate, requirePermission('alarm.read'), async (req, res) => {
+  const alarmId = parseInt(req.params.id);
+  if (!Number.isInteger(alarmId) || alarmId <= 0) {
+    return res.status(400).json({ error: 'Invalid alarm ID' });
+  }
+  try {
+    const result = await acknowledgeAlarm(alarmId, req.user?.id ?? null);
+    if (result.error === 'DB unavailable') return res.status(503).json({ error: 'DB unavailable' });
+    if (!result.found) return res.status(404).json({ error: 'Alarm not found' });
+    res.json({ success: true, id: alarmId, deviceId: result.deviceId });
+  } catch (e) {
+    console.error('POST /api/alarms/:id/acknowledge error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Device alarm snooze ────────────────────────────────────────────────────
+// When a user accepts an alarm on any page, ALL users on that device should stop
+// hearing the sound. These endpoints maintain a shared snooze timestamp per device.
+//
+// GET /api/devices/:deviceId/snooze
+//   → Returns { snoozeUntilMs: <timestamp> | null }
+//
+// PUT /api/devices/:deviceId/snooze
+//   → Body: { snoozeUntilMs: <timestamp> }
+//   → Stores the snooze so all users on the device respect it
+
+app.get('/api/devices/:deviceId/snooze', authenticate, requirePermission('alarm.read'), (req, res) => {
+  const deviceId = parseInt(req.params.deviceId);
+  if (!Number.isInteger(deviceId) || deviceId <= 0) {
+    return res.status(400).json({ error: 'Invalid device ID' });
+  }
+  const snoozeUntilMs = deviceSnoozes.get(deviceId) || null;
+  res.json({ deviceId, snoozeUntilMs });
+});
+
+app.put('/api/devices/:deviceId/snooze', authenticate, requirePermission('alarm.read'), (req, res) => {
+  const deviceId = parseInt(req.params.deviceId);
+  const { snoozeUntilMs } = req.body || {};
+  
+  if (!Number.isInteger(deviceId) || deviceId <= 0) {
+    return res.status(400).json({ error: 'Invalid device ID' });
+  }
+  if (typeof snoozeUntilMs !== 'number' || snoozeUntilMs < 0) {
+    return res.status(400).json({ error: 'Invalid snoozeUntilMs' });
+  }
+  
+  // Store the snooze for this device (shared across all users/browsers).
+  // Write-through: update the in-memory cache immediately, then persist so the
+  // snooze survives a server restart. DB write is best-effort — a DB blip must
+  // not break the live "stop the alarm sound" behaviour.
+  if (snoozeUntilMs > 0) {
+    deviceSnoozes.set(deviceId, snoozeUntilMs);
+  } else {
+    deviceSnoozes.delete(deviceId);
+  }
+  setSnooze(deviceId, snoozeUntilMs, req.user?.id ?? null).catch((e) =>
+    console.warn(`[Snooze] persist failed for device ${deviceId}:`, e.message)
+  );
+
+  res.json({ success: true, deviceId, snoozeUntilMs });
+});
+
+// ── Live alarms endpoints ─────────────────────────────────────────────────
+// Source: in-memory _lastAlarmInfo snapshot updated by the fuel polling loop.
+// An alarm entry is "live" when it was computed within LIVE_ALARM_TTL_MS.
+//
+// GET /api/alarms/live
+//   → Summary list for dashboard cards. Returns one entry per device that
+//     currently has at least one active alarm. No DB round-trip for alarm
+//     data — only a single device-name lookup query.
+//
+// GET /api/alarms/live/:deviceId
+//   → Full detail for one device: device info, all triggered alarms with
+//     fuel/threshold/rate values, consumption snapshot, and last-10 history.
+const LIVE_ALARM_TTL_MS = 5 * 60_000; // treat snapshot as live for 5 min
+
+app.get('/api/alarms/live', authenticate, requirePermission('alarm.read'), async (req, res) => {
+  const now = Date.now();
+
+  // Collect devices with non-stale, non-empty alarm snapshots
+  const active = [];
+  for (const [deviceId, snap] of _lastAlarmInfo) {
+    if (!snap.triggered || snap.triggered.length === 0) continue;
+    if (now - snap.ts > LIVE_ALARM_TTL_MS) continue;
+    active.push({ deviceId, snap });
+  }
+
+  if (active.length === 0) return res.json([]);
+
+  // Single batch query for device names / location ids
+  const conn = await getConnection();
+  const nameMap = {};
+  if (conn) {
+    try {
+      const ids = active.map(a => a.deviceId);
+      const binds = {};
+      const placeholders = ids.map((id, i) => { binds[`d${i}`] = id; return `:d${i}`; });
+      const r = await conn.execute(
+        `SELECT device_id, device_name, location_id
+           FROM MODBUS_ADMIN.devices
+          WHERE device_id IN (${placeholders.join(', ')})`,
+        binds
+      );
+      for (const row of r.rows || []) nameMap[row[0]] = { name: row[1], locationId: row[2] };
+    } catch (_) {}
+    finally { await conn.close().catch(() => {}); }
+  }
+
+  // Scope filter — only return devices visible to this user
+  const visibleRows = await filterVisibleDevices(
+    req.user.id,
+    active.map(({ deviceId }) => ({ id: deviceId }))
+  ).catch(() => active.map(({ deviceId }) => ({ id: deviceId })));
+  const visibleIds = new Set(visibleRows.map(r => r.id));
+
+  const result = active
+    .filter(({ deviceId }) => visibleIds.has(deviceId))
+    .map(({ deviceId, snap }) => {
+      const dev      = nameMap[deviceId] || {};
+      const severity = snap.triggered.some(a => a.severity === 'critical') ? 'critical' : 'warning';
+      return {
+        deviceId,
+        deviceName: dev.name       || `Device ${deviceId}`,
+        locationId: dev.locationId || null,
+        severity,
+        alarmCount: snap.triggered.length,
+        // Compact alarm list — just enough for a card badge
+        alarms: snap.triggered.map(a => ({
+          type:     a.type,
+          severity: a.severity || (a.type === 'ALARM_CRITICAL_FUEL' ? 'critical' : 'warning'),
+          message:  a.message,
+          time:     a.time,
+        })),
+        checkedAt: new Date(snap.ts).toISOString(),
+      };
+    });
+
+  res.json(result);
+});
+
+app.get('/api/alarms/live/:deviceId', authenticate, requirePermission('alarm.read'), async (req, res) => {
+  const deviceId = parseInt(req.params.deviceId);
+  if (!deviceId) return res.status(400).json({ error: 'Invalid deviceId' });
+
+  // Scope check — user must have visibility over this device
+  const visible = await filterVisibleDevices(req.user.id, [{ id: deviceId }]).catch(() => []);
+  if (!visible.length) return res.status(403).json({ error: 'Access denied' });
+
+  const snap = _lastAlarmInfo.get(deviceId);
+  const now  = Date.now();
+  const isLive = !!(snap && snap.triggered && snap.triggered.length > 0 &&
+                    (now - snap.ts) <= LIVE_ALARM_TTL_MS);
+
+  const conn = await getConnection();
+  if (!conn) return res.status(503).json({ error: 'DB unavailable' });
+
+  try {
+    // Device + location + project info in one query
+    const devR = await conn.execute(
+      `SELECT d.device_id, d.device_name, d.device_ip, d.device_port, d.status,
+              l.name AS location_name, p.name AS project_name
+         FROM MODBUS_ADMIN.devices d
+         LEFT JOIN MODBUS_ADMIN.locations l ON l.id        = d.location_id
+         LEFT JOIN MODBUS_ADMIN.projects  p ON p.id        = l.project_id
+        WHERE d.device_id = :deviceId`,
+      { deviceId }
+    );
+    const dev = (devR.rows || [])[0];
+    if (!dev) return res.status(404).json({ error: 'Device not found' });
+
+    // Last 10 alarm history rows from DB
+    const histR = await conn.execute(
+      `SELECT * FROM (
+         SELECT action_id, action_type, action_time
+           FROM MODBUS_ADMIN.device_actions
+          WHERE device_id = :deviceId AND action_type LIKE 'ALARM_%'
+         ORDER BY action_time DESC
+       ) WHERE ROWNUM <= 10`,
+      { deviceId }
+    );
+    const recentHistory = (histR.rows || []).map(row => ({
+      id:       row[0],
+      type:     row[1],
+      time:     row[2],
+      severity: row[1] === 'ALARM_CRITICAL_FUEL'    ? 'critical' : 'warning',
+      message:  row[1] === 'ALARM_CRITICAL_FUEL'    ? 'Fuel critically low'
+               : row[1] === 'ALARM_LOW_FUEL'         ? 'Fuel low'
+               : row[1] === 'ALARM_HIGH_CONSUMPTION' ? 'High consumption rate'
+               : row[1],
+    }));
+
+    res.json({
+      deviceId,
+      deviceName:   dev[1],
+      ip:           dev[2],
+      port:         dev[3],
+      status:       effectiveStatus(dev[0], dev[4], connectedDeviceIds()),
+      locationName: dev[5] || null,
+      projectName:  dev[6] || null,
+      live: {
+        active:    isLive,
+        checkedAt: snap ? new Date(snap.ts).toISOString() : null,
+        // Full alarm detail — includes fuel%, threshold, consumption rate
+        alarms: isLive ? snap.triggered.map(a => ({
+          type:      a.type,
+          severity:  a.severity || (a.type === 'ALARM_CRITICAL_FUEL' ? 'critical' : 'warning'),
+          message:   a.message,
+          time:      a.time,
+          fuel:      a.fuel      ?? null,
+          threshold: a.threshold ?? null,
+          rate:      a.rate      ?? null,
+          samples:   a.samples   ?? null,
+        })) : [],
+        consumption: snap?.consumption || null,
+      },
+      recentHistory,
+    });
+  } catch (e) {
+    console.error('GET /api/alarms/live/:deviceId error:', e.message);
+    res.status(500).json({ error: e.message });
   } finally {
-    try { await conn.close(); } catch (_) {}
+    await conn.close().catch(() => {});
   }
 });
 
@@ -743,10 +1333,17 @@ app.get('/api/projects', authenticate, async (req, res) => {
     // their scope (read-only navigation).
     const { global, ids } = await visibleProjects(req.user.id);
 
+    // BRAND_ID / METHOD carry the project's connection profile (see POST below):
+    // METHOD is 'cloud' (Datakom Rainbow) or 'ip' (Modbus TCP) and drives the
+    // default connection type of devices created under the project. BRAND_NAME is
+    // joined in so the frontend can badge the project without a second lookup.
     if (global) {
       const rows = await query(
-        `SELECT ID, NAME, DESCRIPTION, CREATED_AT, UPDATED_AT
-           FROM MODBUS_ADMIN.projects ORDER BY ID`);
+        `SELECT p.ID, p.NAME, p.DESCRIPTION, p.CREATED_AT, p.UPDATED_AT,
+                p.BRAND_ID, p.METHOD, b.brand_name AS BRAND_NAME
+           FROM MODBUS_ADMIN.projects p
+           LEFT JOIN MODBUS_ADMIN.brands b ON b.brand_id = p.brand_id
+          ORDER BY p.ID`);
       return res.json(rows);
     }
 
@@ -758,10 +1355,12 @@ app.get('/api/projects', authenticate, async (req, res) => {
     arr.forEach((v, i) => { binds[`p${i}`] = v; });
 
     const rows = await query(
-      `SELECT ID, NAME, DESCRIPTION, CREATED_AT, UPDATED_AT
-         FROM MODBUS_ADMIN.projects
-        WHERE ID IN (${names.join(', ')})
-        ORDER BY ID`, binds);
+      `SELECT p.ID, p.NAME, p.DESCRIPTION, p.CREATED_AT, p.UPDATED_AT,
+              p.BRAND_ID, p.METHOD, b.brand_name AS BRAND_NAME
+         FROM MODBUS_ADMIN.projects p
+         LEFT JOIN MODBUS_ADMIN.brands b ON b.brand_id = p.brand_id
+        WHERE p.ID IN (${names.join(', ')})
+        ORDER BY p.ID`, binds);
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -769,12 +1368,26 @@ app.get('/api/projects', authenticate, async (req, res) => {
 });
 
 app.post('/api/projects', authenticate, requirePermission('project.write'), async (req, res) => {
-  const { name, description } = req.body;
+  const { name, description, brand_id, method } = req.body;
   if (!name || name.trim().length === 0) return res.status(400).json({ error: 'Name required' });
+  // A project carries a brand + a connection METHOD ('cloud' = Datakom Rainbow,
+  // 'ip' = Modbus TCP). The method drives the default connection type of devices
+  // created under the project. If the caller doesn't send an explicit method, it
+  // is derived from the brand: a "Datakom" brand starts in cloud method, every
+  // other brand in ip method.
+  const bId = (brand_id === '' || brand_id === null || brand_id === undefined) ? null : parseInt(brand_id);
+  let resolvedMethod = (method === 'cloud' || method === 'ip') ? method : null;
   try {
+    if (!resolvedMethod && bId != null) {
+      const brows = await query('SELECT brand_name FROM MODBUS_ADMIN.brands WHERE brand_id = :id', [bId]);
+      const bname = String(brows[0]?.BRAND_NAME ?? brows[0]?.brand_name ?? '');
+      // Match both "Datakom" (real name) and the "Datacom" spelling → cloud.
+      resolvedMethod = /data[ck]om/i.test(bname) ? 'cloud' : 'ip';
+    }
+    resolvedMethod = resolvedMethod || 'ip';
     await execute(
-      'INSERT INTO MODBUS_ADMIN.projects (name, description) VALUES (:name, :description)',
-      { name: name.trim(), description: description || null }
+      'INSERT INTO MODBUS_ADMIN.projects (name, description, brand_id, method) VALUES (:name, :description, :brand_id, :method)',
+      { name: name.trim(), description: description || null, brand_id: bId, method: resolvedMethod }
     );
     res.status(201).json({ success: true });
   } catch (e) {
@@ -790,7 +1403,12 @@ app.get('/api/projects/:id', authenticate, requirePermission('project.read'), as
   const id = parseInt(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid project ID' });
   try {
-    const rows = await query('SELECT id, name, description, created_at, updated_at FROM MODBUS_ADMIN.projects WHERE id = :id', [id]);
+    const rows = await query(
+      `SELECT p.id, p.name, p.description, p.created_at, p.updated_at,
+              p.brand_id, p.method, b.brand_name
+         FROM MODBUS_ADMIN.projects p
+         LEFT JOIN MODBUS_ADMIN.brands b ON b.brand_id = p.brand_id
+        WHERE p.id = :id`, [id]);
     if (rows.length === 0) return res.status(404).json({ error: 'Project not found' });
     res.json(rows[0]);
   } catch (e) {
@@ -801,12 +1419,24 @@ app.get('/api/projects/:id', authenticate, requirePermission('project.read'), as
 app.put('/api/projects/:id', authenticate, requirePermission('project.write'), async (req, res) => {
   const id = parseInt(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid project ID' });
-  const { name, description } = req.body;
+  const { name, description, brand_id, method } = req.body;
   if (!name || name.trim().length === 0) return res.status(400).json({ error: 'Name required' });
   try {
+    // Name/description always update. brand_id and method are optional — only
+    // touched when the caller sends them, so a plain rename never wipes them.
+    const sets = ['name = :name', 'description = :description'];
+    const binds = { name: name.trim(), description: description || null, id };
+    if (brand_id !== undefined) {
+      sets.push('brand_id = :brand_id');
+      binds.brand_id = (brand_id === '' || brand_id === null) ? null : parseInt(brand_id);
+    }
+    if (method === 'cloud' || method === 'ip') {
+      sets.push('method = :method');
+      binds.method = method;
+    }
     const result = await execute(
-      'UPDATE MODBUS_ADMIN.projects SET name = :name, description = :description WHERE id = :id',
-      { name: name.trim(), description: description || null, id }
+      `UPDATE MODBUS_ADMIN.projects SET ${sets.join(', ')} WHERE id = :id`,
+      binds
     );
     if ((result.rowsAffected || 0) === 0) return res.status(404).json({ error: 'Project not found' });
     res.json({ success: true });
@@ -1066,13 +1696,13 @@ app.get('/api/locations/:locationId/devices', authenticate, requirePermission('d
   if (!Number.isInteger(locationId) || locationId <= 0) return res.status(400).json({ error: 'Invalid location ID' });
   try {
     const rows = await query(
-      `SELECT d.device_id as id, d.device_name as name, d.device_ip as ip, d.device_port as port, d.status, d.location_id, d.latitude, d.longitude, d.altitude, d.last_seen, d.brand_id, b.brand_name
+      `SELECT d.device_id as id, d.device_name as name, d.device_ip as ip, d.device_port as port, d.status, d.location_id, d.latitude, d.longitude, d.altitude, d.last_seen, d.brand_id, d.datakom_did, b.brand_name
          FROM MODBUS_ADMIN.devices d
          LEFT JOIN MODBUS_ADMIN.brands b ON b.brand_id = d.brand_id
         WHERE d.location_id = :locationId ORDER BY d.device_name`,
       [locationId]
     );
-    res.json(rows);
+    res.json(reconcileDeviceRows(rows));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1106,7 +1736,7 @@ app.get('/api/project-tree', authenticate, requirePermission('project.read'), as
 // Update /api/devices to support filters and location_id
 app.get('/api/devices', authenticate, async (req, res) => {
   const { location_id, project_id, status } = req.query;
-  let sql = `SELECT d.device_id as id, d.device_name as name, d.device_ip as ip, d.device_port as port, d.status, d.location_id, d.latitude, d.longitude, d.altitude, d.last_seen, d.brand_id, b.brand_name
+  let sql = `SELECT d.device_id as id, d.device_name as name, d.device_ip as ip, d.device_port as port, d.status, d.location_id, d.latitude, d.longitude, d.altitude, d.last_seen, d.brand_id, d.datakom_did, b.brand_name
                FROM MODBUS_ADMIN.devices d
                LEFT JOIN MODBUS_ADMIN.brands b ON b.brand_id = d.brand_id`;
   const binds = [];
@@ -1132,7 +1762,7 @@ app.get('/api/devices', authenticate, async (req, res) => {
     // Scope filter: return only devices the user can see (global sees all;
     // otherwise their granted devices + devices in projects/locations they hold).
     const visibleRows = await filterVisibleDevices(req.user.id, rows);
-    res.json(visibleRows);
+    res.json(reconcileDeviceRows(visibleRows));
   } catch (e) {
     console.error('GET /api/devices error:', e.message);
     res.status(500).json({ error: e.message });
@@ -1140,8 +1770,8 @@ app.get('/api/devices', authenticate, async (req, res) => {
 });
 
 // Update POST /api/devices to support location_id
-app.post('/api/devices', authenticate, requirePermission('device.write'), async (req, res) => {
-  const { id, name, ip, port, status, location_id, latitude, longitude, brand_id } = req.body;
+app.post('/api/devices', authenticate, requirePermission('device.write'), requirePermissionIfBodyPresent('datakom_did', 'datakom.write'), async (req, res) => {
+  const { id, name, ip, port, status, location_id, latitude, longitude, brand_id, datakom_did } = req.body;
   console.log('POST devices body:', req.body);
   try {
     let device_id = parseInt(id);
@@ -1155,7 +1785,9 @@ app.post('/api/devices', authenticate, requirePermission('device.write'), async 
       device_name: name,
       device_ip: ip,
       device_port: parseInt(port) || 502,
-      status: status || 'online'
+      // A freshly-added device has never been connected — it is offline until a
+      // connect succeeds (which flips it to 'online' via setDeviceStatus).
+      status: status || 'offline'
     };
     if (location_id) {
       columns.push('location_id');
@@ -1164,6 +1796,11 @@ app.post('/api/devices', authenticate, requirePermission('device.write'), async 
     if (brand_id !== undefined && brand_id !== null && brand_id !== '') {
       columns.push('brand_id');
       bindsObj.brand_id = parseInt(brand_id);
+    }
+    // Link to a Datakom Rainbow device (did) — only for brand=Datakom devices.
+    if (datakom_did !== undefined && datakom_did !== null && datakom_did !== '' && !isNaN(parseInt(datakom_did))) {
+      columns.push('datakom_did');
+      bindsObj.datakom_did = parseInt(datakom_did);
     }
     // Optional manual GPS coordinates (also auto-filled from Modbus when connected)
     if (latitude !== undefined && latitude !== null && latitude !== '' && !isNaN(parseFloat(latitude))) {
@@ -1184,7 +1821,8 @@ app.post('/api/devices', authenticate, requirePermission('device.write'), async 
       `INSERT INTO MODBUS_ADMIN.DEVICES (${columns.join(', ')}) VALUES (${values})`,
       bindsObj
     );
-    res.json({ success: true, device: { id: device_id, name, ip, port: parseInt(port), status: status || 'online', location_id, latitude: bindsObj.latitude ?? null, longitude: bindsObj.longitude ?? null } });
+    if (bindsObj.datakom_did != null) refreshDidMap().catch(() => {});
+    res.json({ success: true, device: { id: device_id, name, ip, port: parseInt(port), status: status || 'offline', location_id, latitude: bindsObj.latitude ?? null, longitude: bindsObj.longitude ?? null } });
   } catch (e) {
     console.error('POST /api/devices error:', req.body, e.message);
     res.status(500).json({ error: e.message });
@@ -1192,9 +1830,9 @@ app.post('/api/devices', authenticate, requirePermission('device.write'), async 
 });
 
 // Update PUT /api/devices/:id to support location_id
-app.put('/api/devices/:deviceId', authenticate, requirePermission('device.write'), async (req, res) => {
+app.put('/api/devices/:deviceId', authenticate, requirePermission('device.write'), requirePermissionIfBodyPresent('datakom_did', 'datakom.write'), async (req, res) => {
   const deviceId = parseInt(req.params.deviceId);
-  const { name, ip, port, status, location_id, latitude, longitude, last_seen, brand_id } = req.body;
+  const { name, ip, port, status, location_id, latitude, longitude, last_seen, brand_id, datakom_did } = req.body;
   // Partial update: only touch the columns actually present in the request, so
   // a coordinates-only save doesn't null out (or NaN) name/ip/port/status.
   const updates = [];
@@ -1228,6 +1866,11 @@ app.put('/api/devices/:deviceId', authenticate, requirePermission('device.write'
   if (brand_id !== undefined) {
     updates.push('brand_id = :brand_id');
     bindsObj.brand_id = (brand_id === '' || brand_id === null) ? null : parseInt(brand_id);
+  }
+  // Datakom device link (did). Empty string / null clears it.
+  if (datakom_did !== undefined) {
+    updates.push('datakom_did = :datakom_did');
+    bindsObj.datakom_did = (datakom_did === '' || datakom_did === null) ? null : parseInt(datakom_did);
   }
   // Manual GPS coordinate edits. Empty string clears the coordinate.
   if (latitude !== undefined) {
@@ -1264,6 +1907,7 @@ app.put('/api/devices/:deviceId', authenticate, requirePermission('device.write'
     if ((result.rowsAffected || 0) === 0) {
       res.status(404).json({ error: 'Device not found' });
     } else {
+      if (datakom_did !== undefined) refreshDidMap().catch(() => {});
       res.json({ success: true, updated: deviceId });
     }
   } catch (e) {
@@ -1372,6 +2016,101 @@ app.delete('/api/brands/:id', authenticate, requirePermission('device.write'), a
     res.status(500).json({ error: e.message });
   }
 });
+
+// ============================================================================
+// BRAND DATA SOURCES  (read-only)
+// ============================================================================
+// A few brands expose live values through their own portal rather than Modbus
+// (e.g. Datakom Rainbow over WebSocket — see datakom-rainbow.js). These routes
+// surface that per-brand adapter's cached data. `:brand` is the brand NAME
+// (case-insensitive), matching brands.brand_name. Data is read-only; the only
+// write path is the scaffolded control route at the bottom (inert until an
+// adapter implements sendControl with a real command frame).
+
+// Connection + session diagnostics. Also returns the last raw frames the adapter
+// received, which is what you use to finalize an undocumented protocol's mapping.
+app.get('/api/brands/:brand/status', authenticate, requireAnyPermission(['device.read', 'datakom.read']), (req, res) => {
+  const adapter = brandAdapters.getAdapter(req.params.brand);
+  if (!adapter) return res.status(404).json({ error: `No data-source adapter for brand '${req.params.brand}'` });
+  res.json(adapter.getStatus());
+});
+
+// Devices the brand's portal exposes, each with its latest cached reading.
+app.get('/api/brands/:brand/devices', authenticate, requireAnyPermission(['device.read', 'datakom.read']), (req, res) => {
+  const adapter = brandAdapters.getAdapter(req.params.brand);
+  if (!adapter) return res.status(404).json({ error: `No data-source adapter for brand '${req.params.brand}'` });
+  if (!adapter.isReady?.()) {
+    return res.status(503).json({ error: `Brand '${req.params.brand}' data source not connected yet`, status: adapter.getStatus() });
+  }
+  res.json(adapter.listDevices());
+});
+
+// One device's latest reading. `:id` may be the brand's device id or its name.
+app.get('/api/brands/:brand/device/:id', authenticate, requireAnyPermission(['device.read', 'datakom.read']), (req, res) => {
+  const adapter = brandAdapters.getAdapter(req.params.brand);
+  if (!adapter) return res.status(404).json({ error: `No data-source adapter for brand '${req.params.brand}'` });
+  const data = adapter.getReading(req.params.id);
+  if (!data || (!data.device && !data.reading)) {
+    return res.status(404).json({ error: `Device '${req.params.id}' not found for brand '${req.params.brand}'` });
+  }
+  res.json(data);
+});
+
+// The brand's node hierarchy (nodes → devices), nested — a read-only project
+// tree. Only adapters that expose getTree() support this (Datakom does); others
+// 404 so the frontend can fall back gracefully.
+app.get('/api/brands/:brand/tree', authenticate, requireAnyPermission(['device.read', 'datakom.read']), (req, res) => {
+  const adapter = brandAdapters.getAdapter(req.params.brand);
+  if (!adapter) return res.status(404).json({ error: `No data-source adapter for brand '${req.params.brand}'` });
+  if (typeof adapter.getTree !== 'function') {
+    return res.status(404).json({ error: `Brand '${req.params.brand}' does not expose a device tree` });
+  }
+  if (!adapter.isReady?.()) {
+    return res.status(503).json({ error: `Brand '${req.params.brand}' data source not connected yet`, status: adapter.getStatus() });
+  }
+  res.json(adapter.getTree());
+});
+
+// ── Brand cloud control (start/stop) — SCAFFOLD ─────────────────────────────
+// Most brand adapters are read-only and omit sendControl → 501. Datakom's adapter
+// wires this end-to-end but stays INERT until the Rainbow command frame is known
+// (see buildControlFrame in datakom-rainbow.js), so no guessed frame is ever sent.
+// `:id` is the brand's device id (did); optional ?device_id=<platform id> logs the
+// action against the platform device for Run History. Permission gates mirror the
+// Modbus /api/modbus/start|stop routes exactly.
+function brandControlHandler(action) {
+  return async (req, res) => {
+    const { brand, id } = req.params;
+    const adapter = brandAdapters.getAdapter(brand);
+    if (!adapter) return res.status(404).json({ error: `No data-source adapter for brand '${brand}'` });
+    if (typeof adapter.sendControl !== 'function') {
+      return res.status(501).json({ error: `Brand '${brand}' does not support cloud control` });
+    }
+    try {
+      const result = await adapter.sendControl(id, action);
+      if (!result.ok) {
+        const status =
+          result.code === 'CONTROL_NOT_CONFIGURED' ? 501 :
+          result.code === 'NOT_CONNECTED'          ? 503 :
+          result.code === 'UNKNOWN_DEVICE'         ? 404 : 400;
+        return res.status(status).json({ error: result.error, code: result.code });
+      }
+      // Best-effort action log against the platform device, if the caller passed one.
+      const deviceId = parseInt(req.query.device_id);
+      if (Number.isInteger(deviceId)) logDeviceAction(deviceId, action.toUpperCase()).catch(() => {});
+      res.json({ success: true, ...result });
+    } catch (e) {
+      console.error(`POST /api/brands/${brand}/device/${id}/${action} error:`, e.message);
+      res.status(500).json({ error: e.message });
+    }
+  };
+}
+
+app.post('/api/brands/:brand/device/:id/start', authenticate,
+  requireAnyPermission(['device.start', 'device.control']), brandControlHandler('start'));
+
+app.post('/api/brands/:brand/device/:id/stop', authenticate,
+  requireAnyPermission(['device.stop', 'device.control']), brandControlHandler('stop'));
 
 // ============================================================================
 // DEVICE SETTINGS API
@@ -1495,6 +2234,7 @@ const SETTING_DEFAULTS = {
   CRITICAL_TANK_THRESHOLD:  { value: '10',       type: 'number'  },
   CONSUMPTION_RATE_THRESHOLD:{ value: '5',       type: 'number'  },
   FUEL_ALERTS_ENABLED:      { value: 'true',     type: 'boolean' },
+  ALARM_COOLDOWN_MINUTES:   { value: '60',       type: 'number'  },
   // Tank capacity
   TANK_CAPACITY_LITERS:     { value: '1000',     type: 'number'  },
   TANK_CAPACITY_UNIT:       { value: 'liters',   type: 'string'  },
@@ -1645,8 +2385,148 @@ app.put('/api/settings', authenticate, requirePermission('settings.write'), asyn
   }
 });
 
+// ============================================================================
+// PAGE CONTENT API (admin visual page editor)
+// ============================================================================
+// Stores the frontend's <Editable> overrides so an admin's design edits are
+// global. READ is available to every authenticated user (the overrides must
+// render for everyone); WRITE is gated to settings.write (admins).
+
+// GET current page-content overrides — returns {} when none set.
+app.get('/api/page-content', authenticate, async (_, res) => {
+  try {
+    const overrides = await getPageContent();
+    res.json(overrides);
+  } catch (e) {
+    console.error('GET /api/page-content error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT (replace) page-content overrides. Body: { overrides: { ... } }.
+app.put('/api/page-content', authenticate, requirePermission('settings.write'), async (req, res) => {
+  const { overrides } = req.body;
+  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) {
+    return res.status(400).json({ error: 'overrides object required' });
+  }
+  try {
+    const ok = await savePageContent(overrides, req.user?.id ?? null);
+    if (!ok) return res.status(500).json({ error: 'Failed to save page content' });
+    console.log(`[PageContent] Saved ${Object.keys(overrides).length} override(s)`);
+    res.json({ success: true, overrides });
+  } catch (e) {
+    console.error('PUT /api/page-content error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 
 // ── Startup ───────────────────────────────────────────────────────────────
+// Auto-creates the alarm_acknowledgments table and its sequence if they don't
+// exist yet (safe to call on every startup — uses WHEN OTHERS THEN IF ... END).
+// Also ensures ACTION_TYPE column is wide enough for all alarm type strings.
+async function ensureAckTable() {
+  const conn = await getConnection();
+  if (!conn) return;
+  try {
+    // Widen ACTION_TYPE so ALARM_HIGH_CONSUMPTION (22 chars) fits.
+    // MODIFY is a no-op if the column is already wide enough.
+    try {
+      await conn.execute(
+        `ALTER TABLE MODBUS_ADMIN.device_actions MODIFY (ACTION_TYPE VARCHAR2(50))`
+      );
+      console.log('[DB] device_actions.ACTION_TYPE widened to VARCHAR2(50)');
+    } catch (e) {
+      // ORA-01442 = column is already that size or wider — safe to ignore
+      if (!/ORA-01442|ORA-01451/i.test(e.message)) {
+        console.warn('[DB] Could not widen ACTION_TYPE:', e.message);
+      }
+    }
+    // Link column: which Datakom Rainbow device (did) a device maps to. Nullable;
+    // only set for brand=Datakom devices. ORA-01430 = column already exists.
+    try {
+      await conn.execute(`ALTER TABLE MODBUS_ADMIN.devices ADD (DATAKOM_DID NUMBER)`);
+      console.log('[DB] devices.DATAKOM_DID column added');
+    } catch (e) {
+      if (!/ORA-01430/i.test(e.message)) console.warn('[DB] Could not add DATAKOM_DID:', e.message);
+    }
+    // Project connection profile: BRAND_ID (which brand the project is for) and
+    // METHOD ('cloud' = Datakom Rainbow, 'ip' = Modbus TCP). Added idempotently so
+    // existing DBs upgrade on the next startup — this is what makes the projects
+    // API (GET /api/projects joins p.brand_id) work. Each column is added on its
+    // own so a partially-migrated DB still fills the gap. ORA-01430 = already exists.
+    for (const col of ['BRAND_ID NUMBER', `METHOD VARCHAR2(10) DEFAULT 'ip'`]) {
+      try {
+        await conn.execute(`ALTER TABLE MODBUS_ADMIN.projects ADD (${col})`);
+        console.log(`[DB] projects column added: ${col}`);
+      } catch (e) {
+        if (!/ORA-01430/i.test(e.message)) console.warn(`[DB] Could not add projects.${col}:`, e.message);
+      }
+    }
+    // Sequence for ack_id
+    await conn.execute(`
+      BEGIN
+        EXECUTE IMMEDIATE 'CREATE SEQUENCE MODBUS_ADMIN.alarm_ack_seq START WITH 1 INCREMENT BY 1 NOCACHE';
+      EXCEPTION
+        WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF;
+      END;
+    `);
+    // Table
+    await conn.execute(`
+      BEGIN
+        EXECUTE IMMEDIATE 'CREATE TABLE MODBUS_ADMIN.alarm_acknowledgments (
+          ack_id          NUMBER PRIMARY KEY,
+          action_id       NUMBER NOT NULL,
+          device_id       NUMBER NOT NULL,
+          acknowledged_by NUMBER,
+          acknowledged_at TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
+          CONSTRAINT fk_ack_device FOREIGN KEY (device_id)
+            REFERENCES MODBUS_ADMIN.devices(device_id) ON DELETE CASCADE
+        )';
+      EXCEPTION
+        WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF;
+      END;
+    `);
+    // Index for fast lookups on action_id
+    await conn.execute(`
+      BEGIN
+        EXECUTE IMMEDIATE 'CREATE INDEX MODBUS_ADMIN.ix_ack_action ON MODBUS_ADMIN.alarm_acknowledgments(action_id)';
+      EXCEPTION
+        WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF;
+      END;
+    `);
+    console.log('[DB] alarm_acknowledgments table ready');
+  } catch (e) {
+    console.warn('[DB] ensureAckTable warning:', e.message);
+  } finally {
+    await conn.close().catch(() => {});
+  }
+}
+
+// ── Hosted frontend ─────────────────────────────────────────────────────────
+// Serve the built React app from deploy/www so one port (one tunnel/domain)
+// carries the whole product: `npm run build` in the frontend repo, then copy
+// dist/* into deploy/www. When that folder is absent (normal development —
+// frontend runs on Vite :5173) this block is a no-op.
+{
+  const path = require('path');
+  const fs = require('fs');
+  const FRONTEND_DIR = process.env.FRONTEND_DIR || path.join(__dirname, 'deploy', 'www');
+  const FRONTEND_INDEX = path.join(FRONTEND_DIR, 'index.html');
+  if (fs.existsSync(FRONTEND_INDEX)) {
+    app.use(express.static(FRONTEND_DIR));
+    // SPA fallback: any unknown non-API GET renders the app shell so client-
+    // side routes (/fuel-levels, /alarms, …) survive a refresh. Registered
+    // after every API route, so real endpoints always win.
+    app.use((req, res, next) => {
+      if (req.method !== 'GET') return next();
+      if (req.path.startsWith('/api/') || req.path.startsWith('/ws/') || req.path === '/agent-tunnel') return next();
+      res.sendFile(FRONTEND_INDEX);
+    });
+    console.log(`[Startup] Serving frontend from ${FRONTEND_DIR}`);
+  }
+}
+
 (async () => {
   // Initialise the DB connection pool before accepting requests.
   // If the DB is unreachable at startup the server still starts —
@@ -1654,11 +2534,60 @@ app.put('/api/settings', authenticate, requirePermission('settings.write'), asyn
   const poolOk = await initPool();
   if (!poolOk) {
     console.warn('[Startup] DB pool not ready — server will retry on first request');
+  } else {
+    // Auto-create the alarm_acknowledgments table + sequence if they don't exist.
+    await ensureAckTable();
+    // Auto-create the dedicated alarms table + sequence (source of truth for
+    // the Active Alarms panel) if they don't exist yet.
+    await ensureAlarmsTable();
+    // Auto-create the device_snoozes table, then seed the in-memory cache so
+    // snoozes set before the last restart are still honoured.
+    await ensureSnoozeTable();
+    // Auto-create the page_content table backing the admin visual page editor.
+    await ensurePageContentTable();
+    // Auto-create the system_settings + device_settings tables so the Settings
+    // page persists to the DB (they used to live in the now-removed schema.sql).
+    await ensureSettingsTables();
+    // Seed the built-in permissions + system roles (admin/viewer/operator) so a
+    // fresh DB comes up fully populated. Idempotent + non-destructive.
+    await ensureRbacSeed();
+    // Auto-create + seed the ui_element_catalog so the Permissions editor shows
+    // the full catalog of UI elements instead of the small static fallback.
+    await ensureUiElementCatalog();
+    try {
+      const snoozes = await getActiveSnoozes();
+      for (const [deviceId, until] of snoozes) deviceSnoozes.set(deviceId, until);
+      if (snoozes.size > 0) console.log(`[Startup] Loaded ${snoozes.size} active snooze(s) from DB`);
+    } catch (e) {
+      console.warn('[Startup] Could not load snoozes:', e.message);
+    }
+    // Seed the did→device_id cache so Rainbow connections resolve immediately.
+    await refreshDidMap();
   }
 
   const server = app.listen(PORT, () => {
     console.log(`[Startup] Server listening on port ${PORT}`);
   });
+
+  // Attach the reverse-tunnel WebSocket endpoint (/agent-tunnel) so remote site
+  // agents can dial in and serve their local devices to this server.
+  remoteHub.attach(server);
+
+  // Attach the browser-facing live telemetry stream (/ws/telemetry) so the
+  // frontend can subscribe to real-time fuel/alarm/GPS updates instead of polling.
+  telemetryWs.attach(server);
+
+  // Drive the live telemetry stream: read every connected device on a timer and
+  // push fresh frames to WebSocket subscribers. Self-gates when no browser is
+  // listening, so it costs nothing until someone opens a live page.
+  const _telemetryLoop = setInterval(telemetryPollTick, TELEMETRY_POLL_MS);
+  _telemetryLoop.unref?.();  // don't keep the process alive just for this timer
+  console.log(`[TelemetryWS] Live poll loop every ${TELEMETRY_POLL_MS}ms (set TELEMETRY_POLL_MS to tune)`);
+
+  // Start per-brand read-only data sources (e.g. Datakom Rainbow). Each adapter
+  // self-gates on its own env config, so this is a no-op unless a brand's
+  // credentials are set (DK_ENABLED/DK_USER/DK_PASS for Datakom).
+  brandAdapters.startAll();
 
   // ── Graceful shutdown ─────────────────────────────────────────────────
   async function shutdown(signal) {

@@ -1,0 +1,5 @@
+- [x] Update D-500 alarms page to fetch unacknowledged alarms only (`/api/alarms`) instead of event history (`/api/events`)
+- [x] Update D-500 `AlarmsEventLog` UI to show no “Clear/Delete” history controls; keep ✓ Accept per row (calls acknowledge)
+- [x] Wire row Accept handler to call backend `POST /api/alarms/:id/acknowledge` and then refresh alarms so row disappears immediately
+- [x] Remove unused event-history props/logic from Dashboard after switching to alarms
+- [ ] Build/run D-500 frontend and verify: only live alarms shown, Accept removes row, no delete/clear buttons

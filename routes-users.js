@@ -31,7 +31,7 @@ const router = express.Router();
 
 const { hashPassword, invalidateUserPermsCache, revokeAllSessions } = require('./auth');
 const { authenticate, requirePermission, invalidateEndpointCache } = require('./middleware');
-const { getConnection } = require('./db');
+const { getConnection, restoreDefaultPermissions, restoreDefaultRolePermissions, ensureUiElementCatalog } = require('./db');
 const { query, execute } = require('./db-helpers');
 
 // All routes in this file require an authenticated user.
@@ -407,6 +407,17 @@ router.get('/roles', requirePermission('user.read'), async (_req, res) => {
   }
 });
 
+// ── POST /api/roles/reset ── restore system roles' default permission sets ──
+// Ensures the three built-in system roles exist and resets each one's granted
+// permissions back to its default set. Custom roles are left untouched.
+// Registered before the /roles/:id/* routes so 'reset' isn't read as an id.
+router.post('/roles/reset', requirePermission('user.assign_role'), async (_req, res) => {
+  const r = await restoreDefaultRolePermissions();
+  if (!r.ok) return res.status(500).json({ error: r.error || 'Reset failed' });
+  invalidateUserPermsCache();
+  res.json({ success: true });
+});
+
 // Built-in permission keys — referenced directly in backend route guards and
 // frontend gates. They can be re-described but NOT renamed or deleted from the
 // UI, since removing them would silently break access checks.
@@ -468,6 +479,19 @@ router.post('/permissions', requirePermission('user.assign_role'), async (req, r
     console.error('POST /api/permissions error:', e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── POST /api/permissions/reset ── restore built-in permissions + defaults ─
+// Deletes every custom permission key, restores the built-in ones, re-seeds the
+// UI element catalog, and rebuilds the default permission → UI-element mappings.
+router.post('/permissions/reset', requirePermission('user.assign_role'), async (_req, res) => {
+  // Make sure the catalog exists so the default element mappings resolve.
+  await ensureUiElementCatalog();
+  const r = await restoreDefaultPermissions();
+  if (!r.ok) return res.status(500).json({ error: r.error || 'Reset failed' });
+  invalidateUserPermsCache();
+  invalidateEndpointCache();
+  res.json({ success: true });
 });
 
 // ── PUT /api/permissions/:id ── edit description / resource / action ──────
@@ -599,18 +623,23 @@ router.get('/ui-elements', async (_req, res) => {
 router.get('/ui-element-catalog', async (_req, res) => {
   try {
     const rows = await query(
-      `SELECT element_id, field, label
+      `SELECT element_id, field, label, sort_order
          FROM MODBUS_ADMIN.ui_element_catalog
         ORDER BY sort_order, field, element_id`
     );
-    res.json(rows.map(r => ({ id: r.ELEMENT_ID, field: r.FIELD, label: r.LABEL })));
+    res.json(rows.map(r => ({ 
+      id: r.ELEMENT_ID, 
+      field: r.FIELD, 
+      label: r.LABEL,
+      sortOrder: r.SORT_ORDER 
+    })));
   } catch (e) {
     if (/ORA-00942/i.test(e.message)) return res.json([]); // table not created yet
     res.status(500).json({ error: e.message });
   }
 });
 
-// POST /api/ui-element-catalog { id, field?, label? } — add or update a catalog
+// POST /api/ui-element-catalog { id, field?, label?, sortOrder? } — add or update a catalog
 // element (used to persist a typed-in element so it becomes a reusable checkbox).
 router.post('/ui-element-catalog', requirePermission('user.assign_role'), async (req, res) => {
   const id = String(req.body?.id || '').trim();
@@ -619,17 +648,38 @@ router.post('/ui-element-catalog', requirePermission('user.assign_role'), async 
   }
   const field = (String(req.body?.field || '').trim() || id.split('.')[0] || 'other').slice(0, 40);
   const label = (String(req.body?.label || '').trim() || id).slice(0, 200);
+  const sortOrder = parseInt(req.body?.sortOrder) || 999;
   try {
     await execute(
       `MERGE INTO MODBUS_ADMIN.ui_element_catalog t
          USING (SELECT :id AS element_id FROM dual) s
          ON (t.element_id = s.element_id)
-       WHEN MATCHED THEN UPDATE SET field = :field, label = :label
+       WHEN MATCHED THEN UPDATE SET field = :field, label = :label, sort_order = :sortOrder
        WHEN NOT MATCHED THEN
-         INSERT (element_id, field, label, sort_order) VALUES (:id, :field, :label, 999)`,
-      { id, field, label }
+         INSERT (element_id, field, label, sort_order) VALUES (:id, :field, :label, :sortOrder)`,
+      { id, field, label, sortOrder }
     );
     res.status(201).json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/ui-element-catalog/:id — delete a UI element from catalog
+router.delete('/ui-element-catalog/:id', requirePermission('user.assign_role'), async (req, res) => {
+  const id = String(req.params.id || '').trim();
+  if (!id || id.length > 60) {
+    return res.status(400).json({ error: 'Invalid element id' });
+  }
+  try {
+    const result = await execute(
+      `DELETE FROM MODBUS_ADMIN.ui_element_catalog WHERE element_id = :id`,
+      { id }
+    );
+    if ((result.rowsAffected || 0) === 0) {
+      return res.status(404).json({ error: 'Element not found' });
+    }
+    res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
