@@ -17,6 +17,7 @@ const bcrypt = require('bcrypt');
 const jwt    = require('jsonwebtoken');
 const oracledb = require('oracledb');
 const { getConnection } = require('./db');
+const { keysSatisfying } = require('./rbac-defaults');
 
 // ── Config ────────────────────────────────────────────────────────────────
 const BCRYPT_COST          = 10;
@@ -421,8 +422,14 @@ async function _resolveScopeChain({ projectId, locationId, deviceId }) {
  *   - device_id   matches the target device.
  */
 async function userHasAnyPermission(userId, permissionKeys, scope = null) {
-  const keys = Array.isArray(permissionKeys) ? permissionKeys : [permissionKeys];
-  if (keys.length === 0) return false;
+  const wanted = Array.isArray(permissionKeys) ? permissionKeys : [permissionKeys];
+  if (wanted.length === 0) return false;
+  // Permission implications: a check for a weaker key (e.g. device.read) is
+  // also satisfied by holding a stronger key that implies it (device.write,
+  // device.connect, …) — see PERMISSION_IMPLICATIONS in rbac-defaults.js.
+  // Scope handling is unchanged: the implying grant's own scope must cover
+  // the target, exactly like a direct grant would.
+  const keys = [...new Set(wanted.flatMap(keysSatisfying))];
 
   const raw = _normalizeScope(scope);
   const eff = await _resolveScopeChain(raw);

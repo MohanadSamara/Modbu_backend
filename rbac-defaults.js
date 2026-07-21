@@ -58,6 +58,38 @@ const SYSTEM_ROLES = [
   },
 ];
 
+// ── Permission implications ─────────────────────────────────────────────────
+// A stronger permission automatically includes the weaker ones it needs to be
+// usable. Without this, granting e.g. device.write alone produces a broken
+// experience (can edit devices but not list them). Checks for a key on the
+// RIGHT side are satisfied by holding any key on the LEFT side, at the same
+// scope as the grant. Kept in sync with the frontend copy in
+// FrontEndModbus/.../src/config/uiElements.js (PERMISSION_IMPLICATIONS).
+const PERMISSION_IMPLICATIONS = {
+  'device.write':     ['device.read'],
+  'device.connect':   ['device.read'],
+  'device.control':   ['device.read', 'fuel.read'],
+  'device.start':     ['device.read'],
+  'device.stop':      ['device.read'],
+  'fuel.read':        [],
+  'project.write':    ['project.read'],
+  'location.write':   ['location.read'],
+  'settings.write':   ['settings.read'],
+  'user.write':       ['user.read'],
+  'user.assign_role': ['user.read'],
+  'datakom.write':    ['datakom.read', 'device.read'],
+};
+
+// All permission keys that satisfy a check for `key` (the key itself plus any
+// stronger keys that imply it).
+function keysSatisfying(key) {
+  const out = [key];
+  for (const [strong, implied] of Object.entries(PERMISSION_IMPLICATIONS)) {
+    if (implied.includes(key)) out.push(strong);
+  }
+  return out;
+}
+
 // Resolve a role's `permissions` field into a concrete list of permission keys.
 function permissionKeysForRole(role) {
   if (role.permissions === 'ALL')      return BUILTIN_PERMISSIONS.map((p) => p.key);
@@ -206,6 +238,8 @@ module.exports = {
   BUILTIN_PERMISSION_KEYS: BUILTIN_PERMISSIONS.map((p) => p.key),
   SYSTEM_ROLES,
   UI_ELEMENT_CATALOG,
+  PERMISSION_IMPLICATIONS,
+  keysSatisfying,
   permissionKeysForRole,
   defaultElementMappings,
 };
