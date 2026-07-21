@@ -36,7 +36,7 @@ function targetFromReq(req) {
   return { deviceId, ip, port };
 }
 const oracledb = require('oracledb');
-const { initPool, closePool, getConnection, logDeviceAction, logFuelReading, getConsumptionRate, getFuelHistory, getEventTimes, checkFuelAlarms, ensureAlarmsTable, getActiveAlarms, acknowledgeAlarm, ensureSnoozeTable, getActiveSnoozes, setSnooze, ensurePageContentTable, getPageContent, savePageContent, ensureSettingsTables, ensureRbacSeed, ensureUiElementCatalog } = require('./db');
+const { initPool, closePool, getConnection, logDeviceAction, logFuelReading, getConsumptionRate, getFuelHistory, getEventTimes, checkFuelAlarms, ensureAlarmsTable, getActiveAlarms, acknowledgeAlarm, ensureSnoozeTable, getActiveSnoozes, setSnooze, ensureDatakomNodeNamesTable, getDatakomNodeNames, setDatakomNodeName, ensurePageContentTable, getPageContent, savePageContent, ensureSettingsTables, ensureRbacSeed, ensureUiElementCatalog } = require('./db');
 const { query, execute } = require('./db-helpers');
 const authRoutes  = require('./routes-auth');
 const userRoutes  = require('./routes-users');
@@ -2073,6 +2073,34 @@ app.get('/api/brands/:brand/tree', authenticate, requireAnyPermission(['device.r
   res.json(adapter.getTree());
 });
 
+// ── Datakom node name overrides ─────────────────────────────────────────────
+// The cloud node names are read-only on Datakom's side, so we let users store a
+// local display name per node (keyed by the frontend node id, e.g. dk-node-12).
+// Read is open to anyone who can see the tree; write requires datakom.write.
+app.get('/api/brands/datakom/node-names', authenticate, requireAnyPermission(['device.read', 'datakom.read', 'fuel.read']), async (_req, res) => {
+  try {
+    res.json(await getDatakomNodeNames());
+  } catch (e) {
+    console.error('GET /api/brands/datakom/node-names error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/brands/datakom/node-names/:nodeId', authenticate, requirePermission('datakom.write'), async (req, res) => {
+  const nodeId = String(req.params.nodeId || '').trim();
+  if (!nodeId) return res.status(400).json({ error: 'Missing node id' });
+  const name = (req.body?.name ?? '').toString();
+  if (name.length > 200) return res.status(400).json({ error: 'Name too long (max 200)' });
+  try {
+    const ok = await setDatakomNodeName(nodeId, name, req.user?.id ?? null);
+    if (!ok) return res.status(500).json({ error: 'Failed to save node name' });
+    res.json({ success: true, nodeId, name: name.trim() || null });
+  } catch (e) {
+    console.error('PUT /api/brands/datakom/node-names error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Brand cloud control (start/stop) — SCAFFOLD ─────────────────────────────
 // Most brand adapters are read-only and omit sendControl → 501. Datakom's adapter
 // wires this end-to-end but stays INERT until the Rainbow command frame is known
@@ -2545,6 +2573,8 @@ async function ensureAckTable() {
     // Auto-create the device_snoozes table, then seed the in-memory cache so
     // snoozes set before the last restart are still honoured.
     await ensureSnoozeTable();
+    // Custom names for Datakom cloud nodes (renamed locally, cloud untouched).
+    await ensureDatakomNodeNamesTable();
     // Auto-create the page_content table backing the admin visual page editor.
     await ensurePageContentTable();
     // Auto-create the system_settings + device_settings tables so the Settings

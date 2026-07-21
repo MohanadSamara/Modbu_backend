@@ -831,6 +831,90 @@ async function setSnooze(deviceId, snoozeUntilMs, userId = null) {
   }
 }
 
+// ── Datakom node name overrides ───────────────────────────────────────────
+// Datakom Rainbow node names come from the cloud portal and can't be renamed
+// there. This stores a per-node custom name shown INSTEAD of the cloud name,
+// keyed by the frontend's node id (e.g. 'dk-node-1234'). The cloud is never
+// touched — clearing the override reverts to the portal name.
+async function ensureDatakomNodeNamesTable() {
+  const conn = await getConnection();
+  if (!conn) return;
+  try {
+    await conn.execute(`
+      BEGIN
+        EXECUTE IMMEDIATE 'CREATE TABLE MODBUS_ADMIN.datakom_node_names (
+          node_id     VARCHAR2(128) PRIMARY KEY,
+          custom_name VARCHAR2(200) NOT NULL,
+          updated_by  NUMBER,
+          updated_at  TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL
+        )';
+      EXCEPTION
+        WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF;
+      END;
+    `);
+    console.log('[DB] datakom_node_names table ready');
+  } catch (e) {
+    console.warn('[DB] ensureDatakomNodeNamesTable warning:', e.message);
+  } finally {
+    await conn.close().catch(() => {});
+  }
+}
+
+// Return all overrides as { nodeId: customName }.
+async function getDatakomNodeNames() {
+  const out = {};
+  const conn = await getConnection();
+  if (!conn) return out;
+  try {
+    const r = await conn.execute(`SELECT node_id, custom_name FROM MODBUS_ADMIN.datakom_node_names`);
+    for (const row of r.rows || []) out[String(row[0])] = String(row[1]);
+    return out;
+  } catch (e) {
+    console.warn('[DB] getDatakomNodeNames failed:', e.message);
+    return out;
+  } finally {
+    await conn.close().catch(() => {});
+  }
+}
+
+// Upsert a custom name for a node, or clear it when name is empty/null. Returns
+// true on success.
+async function setDatakomNodeName(nodeId, name, userId = null) {
+  const conn = await getConnection();
+  if (!conn) return false;
+  try {
+    const clean = (name ?? '').toString().trim();
+    if (!clean) {
+      await conn.execute(
+        `DELETE FROM MODBUS_ADMIN.datakom_node_names WHERE node_id = :nodeId`,
+        { nodeId }, { autoCommit: true }
+      );
+      return true;
+    }
+    const upd = await conn.execute(
+      `UPDATE MODBUS_ADMIN.datakom_node_names
+          SET custom_name = :name, updated_by = :userId, updated_at = SYSTIMESTAMP
+        WHERE node_id = :nodeId`,
+      { name: clean, userId, nodeId }, { autoCommit: false }
+    );
+    if ((upd.rowsAffected || 0) === 0) {
+      await conn.execute(
+        `INSERT INTO MODBUS_ADMIN.datakom_node_names (node_id, custom_name, updated_by)
+         VALUES (:nodeId, :name, :userId)`,
+        { nodeId, name: clean, userId }, { autoCommit: false }
+      );
+    }
+    await conn.commit();
+    return true;
+  } catch (e) {
+    await conn.rollback().catch(() => {});
+    console.warn('[DB] setDatakomNodeName failed:', e.message);
+    return false;
+  } finally {
+    await conn.close().catch(() => {});
+  }
+}
+
 // ── Page content overrides (admin visual editor) ──────────────────────────
 // Stores the frontend's <Editable> overrides as a single JSON blob so design
 // tweaks made by an admin are global — visible to every user on every device.
@@ -1249,5 +1333,8 @@ module.exports = {
   ensureSnoozeTable,
   getActiveSnoozes,
   setSnooze,
+  ensureDatakomNodeNamesTable,
+  getDatakomNodeNames,
+  setDatakomNodeName,
   oracledb,
 };
