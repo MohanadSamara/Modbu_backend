@@ -245,12 +245,20 @@ app.get('/api/modbus/session', authenticate, requirePermission('device.read'), (
   // dashboard's "Device Connections" section shows them alongside Modbus devices.
   const dkAdapter = brandAdapters.getAdapter('datakom');
   if (dkAdapter?.isReady?.()) {
-    const existingIds = new Set(
-      session.devices.map((d) => (d.deviceId != null ? Number(d.deviceId) : null))
+    // Only a CONNECTED Modbus entry suppresses the cloud injection (local Modbus
+    // wins when it's actually up). A disconnected/failed Modbus entry — e.g. left
+    // behind by a Connect attempt that timed out because we're off the device's
+    // LAN — must NOT block the cloud path, or clicking Connect would knock the
+    // device offline instead of falling back to Datakom.
+    const connectedIds = new Set(
+      session.devices
+        .filter((d) => d.connected && d.deviceId != null)
+        .map((d) => Number(d.deviceId))
     );
-    for (const [did, devId] of _didToDeviceId) {
+    for (const [devId, did] of _deviceIdToDid) {
+      if (connectedIds.has(devId)) continue;
       const r = dkAdapter.getReading(did);
-      if (r?.reading && !existingIds.has(devId)) {
+      if (r?.reading) {
         session.devices.push({
           connected: true,
           deviceId:  devId,
@@ -258,7 +266,7 @@ app.get('/api/modbus/session', authenticate, requirePermission('device.read'), (
           did,
           readAt:    r.reading.readAt,
         });
-        existingIds.add(devId);
+        connectedIds.add(devId);
       }
     }
     if (!session.connected && session.devices.some((d) => d.connected)) {
@@ -737,8 +745,13 @@ app.get('/api/modbus/fuel', authenticate, requirePermission('fuel.read'), async 
   const target = targetFromReq(req);
   try {
     if (!isConnected(target)) {
-      // Not connected to THIS device. Its hub (if any) auto-reconnects on its
-      // own timer, so just report unavailable — no global reconnect here.
+      // Not connected to THIS device over Modbus/IP. If it is also linked to a
+      // Datakom cloud device, fail over to the live cloud reading so a dual-homed
+      // device keeps serving fuel from whichever source is up.
+      const dk = target.deviceId ? datakomFuelForDevice(target.deviceId) : null;
+      if (dk) return _sendCloudFuel(res, target.deviceId, dk);
+      // Its hub (if any) auto-reconnects on its own timer, so just report
+      // unavailable — no global reconnect here.
       return res.status(503).json({
         error: 'Modbus device unavailable',
         detail: 'No active connection to this device. Verify device power/network and TCP port 502, then reconnect.',
@@ -758,6 +771,10 @@ app.get('/api/modbus/fuel', authenticate, requirePermission('fuel.read'), async 
       //     expected state — not an error. Return 200 with fuel:null so the UI
       //     shows a calm "No reading" instead of a red error every few seconds.
       if (!isConnected(target)) {
+        // Socket dropped mid-read. Fail over to the Datakom cloud reading if this
+        // device is also linked to one, so the value survives a Modbus blip.
+        const dk = target.deviceId ? datakomFuelForDevice(target.deviceId) : null;
+        if (dk) return _sendCloudFuel(res, target.deviceId, dk);
         return res.status(502).json({
           error: 'Fuel read failed',
           code: 'MODBUS_READ_FAILED'
@@ -842,22 +859,80 @@ async function setDeviceStatus(deviceId, status) {
 //   • stored 'online' but no live link  → 'offline'  (stale write)
 //   • stored 'offline' / 'shutdown'     → left unchanged
 
-// Cache: Datakom did(number) → platform device_id. Built at startup and refreshed
-// after any device create/update, so connectedDeviceIds() can resolve Rainbow
-// connections to platform IDs without a synchronous DB query.
-const _didToDeviceId = new Map();
+// Cache: platform device_id → Datakom did. Built at startup and refreshed after
+// any device create/update, so the session merge and connectedDeviceIds() can
+// resolve Rainbow connections to platform IDs without a synchronous DB query.
+// Keyed by device_id (NOT did) on purpose: two platform devices can be linked to
+// the SAME did, and a did→device map would collapse them so only one ever shows
+// the cloud connection. It also lets a device that carries BOTH an IP and a
+// datakom_did resolve its linked cloud reading, so the Modbus/IP and Datakom
+// cloud sources can serve it interchangeably (failover).
+const _deviceIdToDid = new Map();
 async function refreshDidMap() {
   try {
-    const result = await query(
+    // query() resolves to the rows array itself (not a {rows} wrapper).
+    const rows = await query(
       `SELECT device_id, datakom_did FROM MODBUS_ADMIN.devices WHERE datakom_did IS NOT NULL`
     );
-    _didToDeviceId.clear();
-    for (const r of (result.rows || [])) {
+    _deviceIdToDid.clear();
+    for (const r of (rows || [])) {
       const did   = Number(r.DATAKOM_DID  ?? r.datakom_did);
       const devId = Number(r.DEVICE_ID    ?? r.device_id);
-      if (Number.isFinite(did) && Number.isFinite(devId)) _didToDeviceId.set(did, devId);
+      if (Number.isFinite(did) && Number.isFinite(devId)) {
+        _deviceIdToDid.set(devId, did);
+      }
     }
-  } catch (_) { /* non-fatal — map stays with last good values */ }
+  } catch (_) { /* non-fatal — map keeps its last good values */ }
+}
+
+// Live Datakom Rainbow fuel reading for a platform device linked to a cloud
+// device (datakom_did). Returns { fuel, readAt } when the cloud has a fresh,
+// percentage-scaled reading, else null. Used as the failover source on
+// /api/modbus/fuel so a device configured with both an IP and a Datakom link
+// keeps serving fuel from the cloud whenever its Modbus/IP connection is down
+// (and from Modbus whenever that is up).
+function datakomFuelForDevice(deviceId) {
+  const did = _deviceIdToDid.get(Number(deviceId));
+  if (did == null) return null;
+  const dkAdapter = brandAdapters.getAdapter('datakom');
+  if (!dkAdapter?.isReady?.()) return null;
+  const r = dkAdapter.getReading(did);
+  const reading = r && r.reading;
+  if (!reading) return null;
+  const fm = reading.metrics ? reading.metrics.fuelLevel : null;
+  // Only trust a percentage-scaled fuel value (matches the gauges' %-scale),
+  // mirroring datakom-rainbow.summarizeDevice().
+  const fuel = fm && fm.value != null && (fm.unit == null || /%/.test(String(fm.unit)))
+    ? fm.value : null;
+  if (fuel == null) return null;
+  return { fuel, readAt: reading.readAt || null };
+}
+
+// Send a fuel response sourced from the Datakom cloud (used when Modbus/IP is
+// unavailable for a dual-homed device). Mirrors the shape of the Modbus fuel
+// response, tagged with source:'datakom', and pushes the value to live
+// subscribers so WS clients agree. Alarm/consumption come from the last snapshot.
+function _sendCloudFuel(res, deviceId, dk) {
+  const snap = deviceId ? _lastAlarmInfo.get(deviceId) : null;
+  const payload = {
+    fuel:            dk.fuel,
+    consumptionRate: snap?.consumption ? snap.consumption.ratePerHour : null,
+    consumption:     snap?.consumption || null,
+    alarms:          snap?.triggered   || [],
+    source:          'datakom',
+    readAt:          dk.readAt,
+  };
+  res.json(payload);
+  if (deviceId) {
+    telemetryWs.broadcastTelemetry(deviceId, {
+      fuel:            dk.fuel,
+      consumptionRate: payload.consumptionRate,
+      consumption:     payload.consumption,
+      alarms:          payload.alarms,
+      source:          'datakom',
+      at:              dk.readAt || new Date().toISOString(),
+    });
+  }
 }
 
 function connectedDeviceIds() {
@@ -867,12 +942,14 @@ function connectedDeviceIds() {
       if (d.connected && d.deviceId != null) ids.add(Number(d.deviceId));
     }
   } catch { /* session not ready — treat as nothing connected */ }
-  // Also count devices live via Datakom Rainbow as connected.
+  // Also count devices live via Datakom Rainbow as connected. Every platform
+  // device linked to a live did is included — including multiple devices sharing
+  // one did — so a dual-homed device shows online whenever its cloud side is up.
   const dkAdapter = brandAdapters.getAdapter('datakom');
   if (dkAdapter?.isReady?.()) {
-    for (const did of dkAdapter.connectedDids()) {
-      const devId = _didToDeviceId.get(did);
-      if (devId != null) ids.add(devId);
+    const liveDids = new Set(Array.from(dkAdapter.connectedDids(), Number));
+    for (const [devId, did] of _deviceIdToDid) {
+      if (liveDids.has(Number(did))) ids.add(devId);
     }
   }
   return ids;
