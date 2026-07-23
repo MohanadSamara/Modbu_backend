@@ -36,7 +36,10 @@ function targetFromReq(req) {
   return { deviceId, ip, port };
 }
 const oracledb = require('oracledb');
-const { initPool, closePool, getConnection, logDeviceAction, logFuelReading, getConsumptionRate, getFuelHistory, getEventTimes, checkFuelAlarms, ensureAlarmsTable, getActiveAlarms, acknowledgeAlarm, ensureSnoozeTable, getActiveSnoozes, setSnooze, ensureDatakomNodeNamesTable, getDatakomNodeNames, setDatakomNodeName, ensureDatakomNodeContainersTable, getDatakomNodeContainers, setDatakomNodeContainer, ensureProjectParentColumn, projectParentWouldCycle, ensurePageContentTable, getPageContent, savePageContent, ensureSettingsTables, ensureRbacSeed, ensureUiElementCatalog } = require('./db');
+const { initPool, closePool, getConnection, logDeviceAction, logFuelReading, getConsumptionRate, getFuelHistory, getEventTimes, checkFuelAlarms, ensureAlarmsTable, getActiveAlarms, acknowledgeAlarm, ensureSnoozeTable, getActiveSnoozes, setSnooze, ensureDatakomNodeNamesTable, getDatakomNodeNames, setDatakomNodeName, ensureDatakomNodeContainersTable, getDatakomNodeContainers, setDatakomNodeContainer, ensureProjectParentColumn, projectParentWouldCycle, ensurePageContentTable, getPageContent, savePageContent, ensureSettingsTables, ensureRbacSeed, ensureUiElementCatalog, ensureDatakomSyncTables, getSystemSetting, setSystemSetting } = require('./db');
+// Datakom cloud→DB sync job: materialises the Rainbow tree as editable
+// projects/locations/devices rows (see datakom-sync.js).
+const datakomSync = require('./datakom-sync');
 const { query, execute } = require('./db-helpers');
 const authRoutes  = require('./routes-auth');
 const userRoutes  = require('./routes-users');
@@ -2127,7 +2130,90 @@ app.delete('/api/brands/:id', authenticate, requirePermission('device.write'), a
 app.get('/api/brands/:brand/status', authenticate, requireAnyPermission(['device.read', 'datakom.read']), (req, res) => {
   const adapter = brandAdapters.getAdapter(req.params.brand);
   if (!adapter) return res.status(404).json({ error: `No data-source adapter for brand '${req.params.brand}'` });
-  res.json(adapter.getStatus());
+  const status = adapter.getStatus();
+  // recentFrames is heavy (raw protocol frames, kept for calibration) — only
+  // include it when explicitly asked for with ?raw=1.
+  if (req.query.raw !== '1' && status && typeof status === 'object') delete status.recentFrames;
+  res.json(status);
+});
+
+// ── Datakom adapter runtime control ─────────────────────────────────────────
+// Start/stop the cloud connection at runtime (no server restart needed). The
+// enabled flag persists in system_settings (DK_ADAPTER_ENABLED) and overrides
+// the DK_ENABLED env default at boot. A manual start also recovers from the
+// "gave up after N failed attempts" state.
+function datakomAdapterOr404(req, res) {
+  const adapter = brandAdapters.getAdapter('datakom');
+  if (!adapter || typeof adapter.stop !== 'function') {
+    res.status(404).json({ error: 'Datakom adapter not available' });
+    return null;
+  }
+  return adapter;
+}
+
+app.post('/api/brands/datakom/adapter/start', authenticate, requirePermission('datakom.write'), async (req, res) => {
+  const adapter = datakomAdapterOr404(req, res);
+  if (!adapter) return;
+  try {
+    await setSystemSetting('DK_ADAPTER_ENABLED', '1', 'boolean');
+    adapter.setEnabled(true);
+    adapter.start();
+    const status = adapter.getStatus();
+    delete status.recentFrames;
+    res.json({ success: true, status });
+  } catch (e) {
+    console.error('POST /api/brands/datakom/adapter/start error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/brands/datakom/adapter/stop', authenticate, requirePermission('datakom.write'), async (req, res) => {
+  const adapter = datakomAdapterOr404(req, res);
+  if (!adapter) return;
+  try {
+    await setSystemSetting('DK_ADAPTER_ENABLED', '0', 'boolean');
+    adapter.setEnabled(false);
+    adapter.stop();
+    const status = adapter.getStatus();
+    delete status.recentFrames;
+    res.json({ success: true, status });
+  } catch (e) {
+    console.error('POST /api/brands/datakom/adapter/stop error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/brands/datakom/adapter/restart', authenticate, requirePermission('datakom.write'), (req, res) => {
+  const adapter = datakomAdapterOr404(req, res);
+  if (!adapter) return;
+  try {
+    adapter.stop();
+    adapter.setEnabled(true);
+    adapter.start();
+    const status = adapter.getStatus();
+    delete status.recentFrames;
+    res.json({ success: true, status });
+  } catch (e) {
+    console.error('POST /api/brands/datakom/adapter/restart error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Datakom cloud→DB sync ───────────────────────────────────────────────────
+// Materialise the cloud tree into editable projects/locations/devices rows.
+// Runs automatically on a timer (see startup); these routes trigger/inspect it.
+app.post('/api/brands/datakom/sync', authenticate, requirePermission('datakom.write'), async (_req, res) => {
+  try {
+    const summary = await datakomSync.runSync();
+    res.json(summary);
+  } catch (e) {
+    console.error('POST /api/brands/datakom/sync error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/brands/datakom/sync/status', authenticate, requireAnyPermission(['datakom.read', 'device.read']), (_req, res) => {
+  res.json(datakomSync.getSyncStatus());
 });
 
 // Devices the brand's portal exposes, each with its latest cached reading.
@@ -2146,6 +2232,11 @@ app.get('/api/brands/:brand/devices', authenticate, requireAnyPermission(['devic
 app.get('/api/brands/:brand/device/:id', authenticate, requireAnyPermission(['device.read', 'datakom.read', 'fuel.read']), (req, res) => {
   const adapter = brandAdapters.getAdapter(req.params.brand);
   if (!adapter) return res.status(404).json({ error: `No data-source adapter for brand '${req.params.brand}'` });
+  // A stopped/disconnected adapter still holds the LAST reading in memory —
+  // don't serve it as if live, or the UI keeps "streaming" after a Stop.
+  if (!adapter.isReady?.()) {
+    return res.status(503).json({ error: `Brand '${req.params.brand}' data source not connected`, status: adapter.getStatus?.()?.stopped ? 'stopped' : 'disconnected' });
+  }
   const data = adapter.getReading(req.params.id);
   if (!data || (!data.device && !data.reading)) {
     return res.status(404).json({ error: `Device '${req.params.id}' not found for brand '${req.params.brand}'` });
@@ -2719,8 +2810,22 @@ async function ensureAckTable() {
     } catch (e) {
       console.warn('[Startup] Could not load snoozes:', e.message);
     }
+    // Auto-create the Datakom cloud→DB sync map tables (node/did anchors).
+    await ensureDatakomSyncTables();
     // Seed the did→device_id cache so Rainbow connections resolve immediately.
     await refreshDidMap();
+    // Apply the persisted runtime enable/disable override for the Datakom
+    // adapter (set from the Datakom connection control page) BEFORE startAll.
+    try {
+      const dkEnabled = await getSystemSetting('DK_ADAPTER_ENABLED');
+      if (dkEnabled != null) {
+        const adapter = brandAdapters.getAdapter('datakom');
+        adapter?.setEnabled?.(dkEnabled === '1');
+        console.log(`[Startup] Datakom adapter runtime override: ${dkEnabled === '1' ? 'enabled' : 'disabled'}`);
+      }
+    } catch (e) {
+      console.warn('[Startup] Could not read DK_ADAPTER_ENABLED:', e.message);
+    }
   }
 
   const server = app.listen(PORT, () => {
@@ -2746,6 +2851,12 @@ async function ensureAckTable() {
   // self-gates on its own env config, so this is a no-op unless a brand's
   // credentials are set (DK_ENABLED/DK_USER/DK_PASS for Datakom).
   brandAdapters.startAll();
+
+  // Datakom cloud→DB sync loop: waits for the adapter to be ready, then
+  // imports new cloud nodes/devices as real DB rows on a cadence (DK_SYNC_MS,
+  // default 10 min). Creates-only — user renames/moves/deletes are respected.
+  datakomSync.configure({ refreshDidMap });
+  datakomSync.startSyncLoop();
 
   // ── Graceful shutdown ─────────────────────────────────────────────────
   async function shutdown(signal) {

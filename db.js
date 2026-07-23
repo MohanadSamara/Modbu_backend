@@ -1052,6 +1052,102 @@ async function setDatakomNodeContainer(nodeId, container, userId = null) {
   }
 }
 
+// ── Datakom cloud→DB sync maps ────────────────────────────────────────────
+// The sync job (datakom-sync.js) materialises the Datakom Rainbow cloud tree
+// into real projects/locations/devices rows. These two tables are the
+// idempotency anchors: a cloud node/device is matched by its map row, never by
+// name, so user renames/moves/deletes are respected on later syncs.
+//   datakom_node_map: node_key ('node:<id>' | 'folder:<name>' | 'ungrouped')
+//     → the project or location the sync created for it.
+//   datakom_did_map: did → the DEVICES row the sync created. The row doubles
+//     as a tombstone: if the user deletes the device, the map row remains and
+//     the sync never recreates it.
+async function ensureDatakomSyncTables() {
+  const conn = await getConnection();
+  if (!conn) return;
+  try {
+    await conn.execute(`
+      BEGIN
+        EXECUTE IMMEDIATE 'CREATE TABLE MODBUS_ADMIN.datakom_node_map (
+          node_key    VARCHAR2(64) NOT NULL,
+          entity_type VARCHAR2(10) NOT NULL CHECK (entity_type IN (''project'',''location'')),
+          entity_id   NUMBER NOT NULL,
+          created_at  TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
+          CONSTRAINT pk_datakom_node_map PRIMARY KEY (node_key, entity_type)
+        )';
+      EXCEPTION
+        WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF;
+      END;
+    `);
+    await conn.execute(`
+      BEGIN
+        EXECUTE IMMEDIATE 'CREATE TABLE MODBUS_ADMIN.datakom_did_map (
+          did        NUMBER PRIMARY KEY,
+          device_id  NUMBER,
+          created_at TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL
+        )';
+      EXCEPTION
+        WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF;
+      END;
+    `);
+    console.log('[DB] datakom_node_map + datakom_did_map tables ready');
+  } catch (e) {
+    console.warn('[DB] ensureDatakomSyncTables warning:', e.message);
+  } finally {
+    await conn.close().catch(() => {});
+  }
+}
+
+// ── Single system setting get/set ─────────────────────────────────────────
+// Small helpers for backend-owned settings (e.g. DK_ADAPTER_ENABLED) that are
+// read at boot / written by control routes, without going through the full
+// /api/settings machinery.
+async function getSystemSetting(key) {
+  const conn = await getConnection();
+  if (!conn) return null;
+  try {
+    const r = await conn.execute(
+      `SELECT setting_value FROM MODBUS_ADMIN.system_settings WHERE setting_key = :key`,
+      { key }
+    );
+    const v = r.rows?.[0]?.[0];
+    return v == null ? null : String(v);
+  } catch (e) {
+    console.warn('[DB] getSystemSetting failed:', e.message);
+    return null;
+  } finally {
+    await conn.close().catch(() => {});
+  }
+}
+
+async function setSystemSetting(key, value, type = 'string') {
+  const conn = await getConnection();
+  if (!conn) return false;
+  try {
+    const upd = await conn.execute(
+      `UPDATE MODBUS_ADMIN.system_settings
+          SET setting_value = :value, setting_type = :type, updated_at = SYSTIMESTAMP
+        WHERE setting_key = :key`,
+      { key, value: String(value), type }, { autoCommit: false }
+    );
+    if ((upd.rowsAffected || 0) === 0) {
+      await conn.execute(
+        `INSERT INTO MODBUS_ADMIN.system_settings (setting_key, setting_value, setting_type)
+         VALUES (:key, :value, :type)`,
+        { key, value: String(value), type }, { autoCommit: false }
+      );
+    }
+    await conn.commit();
+    return true;
+  } catch (e) {
+    await conn.rollback().catch(() => {});
+    console.warn('[DB] setSystemSetting failed:', e.message);
+    return false;
+  } finally {
+    await conn.close().catch(() => {});
+  }
+}
+
 // ── Page content overrides (admin visual editor) ──────────────────────────
 // Stores the frontend's <Editable> overrides as a single JSON blob so design
 // tweaks made by an admin are global — visible to every user on every device.
@@ -1476,6 +1572,9 @@ module.exports = {
   ensureDatakomNodeContainersTable,
   getDatakomNodeContainers,
   setDatakomNodeContainer,
+  ensureDatakomSyncTables,
+  getSystemSetting,
+  setSystemSetting,
   ensureProjectParentColumn,
   projectParentWouldCycle,
   oracledb,

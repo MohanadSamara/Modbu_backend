@@ -217,6 +217,7 @@ const UI_ELEMENT_CATALOG = [
   { id: 'datakom.read',          field: 'datakom',    label: 'Live — Datakom Rainbow view',    sortOrder: 96 },
   { id: 'datakom.link',          field: 'datakom',    label: 'Link device to Datakom Rainbow', sortOrder: 97 },
   { id: 'datakom.unlink',        field: 'datakom',    label: 'Unlink Datakom device',          sortOrder: 98 },
+  { id: 'datakom.adapter',       field: 'datakom',    label: 'Datakom cloud connection control (start/stop/sync)', sortOrder: 99 },
 ];
 
 // ── Default permission → UI element mappings ─────────────────────────────────

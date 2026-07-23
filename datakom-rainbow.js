@@ -82,8 +82,15 @@ let connectedAt = null;
 let lastError = null;
 let reconnectDelay = RECONNECT_MIN_MS;
 let repumpTimer = null;
+let reconnectTimer = null;         // pending scheduleReconnect timeout (cancellable)
 let failedCycles = 0;              // consecutive connects that never reached login
 let gaveUp = false;                // stopped reconnecting to avoid hammering the server
+let stopped = false;               // explicitly stopped via stop() — no reconnects
+// Runtime enable override (null = follow env DK_ENABLED). Persisted by index.js
+// in system_settings (DK_ADAPTER_ENABLED) and applied at boot via setEnabled().
+let enabledOverride = null;
+
+function isEnabled() { return enabledOverride != null ? enabledOverride : CFG.enabled; }
 
 // Tree/device bookkeeping for the paginated devx_list walk.
 let nodes = [];                    // [{ id, parent, name }]
@@ -400,6 +407,9 @@ function connect() {
     ready = false;
     if (repumpTimer) { clearInterval(repumpTimer); repumpTimer = null; }
 
+    // Explicit stop(): don't count a failure, don't reconnect.
+    if (stopped) return;
+
     if (wasReady) failedCycles = 0; else failedCycles += 1;
 
     if (failedCycles >= MAX_FAILED_CYCLES) {
@@ -425,23 +435,56 @@ function connect() {
 }
 
 function scheduleReconnect() {
-  setTimeout(() => { if (CFG.enabled && !gaveUp) connect(); }, reconnectDelay);
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (isEnabled() && !gaveUp && !stopped) connect();
+  }, reconnectDelay);
   reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
 }
 
 // ── Public read-only surface (consumed by the brand-adapter registry) ────────
+// start() is called once at boot AND manually from the adapter control API.
+// A manual start always clears gaveUp/stopped and resets the backoff, so a
+// "gave up after 8 failures" state is recoverable without a process restart.
 function start() {
-  if (starting) return;                 // idempotent
-  if (!CFG.enabled) {
-    console.log('[Datakom] DK_ENABLED is not set — Datakom Rainbow adapter is off.');
+  if (!isEnabled()) {
+    console.log('[Datakom] Adapter is disabled (DK_ENABLED / runtime setting) — not starting.');
     return;
   }
   if (!CFG.user || !CFG.pass) {
     console.warn('[Datakom] DK_USER / DK_PASS not set — cannot start Datakom adapter.');
     return;
   }
+  // Already connected/connecting with a live socket — idempotent no-op.
+  if (starting && ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  stopped = false;
+  gaveUp = false;
+  failedCycles = 0;
+  reconnectDelay = RECONNECT_MIN_MS;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   starting = true;
   connect();
+}
+
+// Stop the adapter: close the socket and cancel every pending timer so nothing
+// resurrects the connection. Last-known devices/readings stay in memory so the
+// UI keeps showing the final snapshot (marked not-ready).
+function stop() {
+  stopped = true;
+  starting = false;
+  ready = false;
+  session = null;
+  if (repumpTimer)    { clearInterval(repumpTimer);   repumpTimer = null; }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+  console.log('[Datakom] Adapter stopped (manual).');
+}
+
+// Runtime enable/disable override on top of env DK_ENABLED (null = follow env).
+// Does NOT itself start/stop the socket — callers pair it with start()/stop().
+function setEnabled(v) {
+  enabledOverride = v == null ? null : !!v;
 }
 
 function isReady() { return ready; }
@@ -449,10 +492,12 @@ function isReady() { return ready; }
 function getStatus() {
   return {
     brand:       'datakom',
-    enabled:     CFG.enabled,
+    enabled:     isEnabled(),
+    enabledSource: enabledOverride != null ? 'runtime' : 'env',
     url:         CFG.url,
     push:        CFG.push,
     ready,
+    stopped,
     gaveUp,
     connectedAt,
     lastError,
@@ -621,4 +666,4 @@ function connectedDids() {
   return new Set(readingsById.keys());
 }
 
-module.exports = { start, isReady, getStatus, listDevices, getReading, getTree, sendControl, connectedDids };
+module.exports = { start, stop, setEnabled, isReady, getStatus, listDevices, getReading, getTree, sendControl, connectedDids };
