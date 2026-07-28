@@ -77,13 +77,20 @@ const MAX_RECENT         = 300;      // raw frames kept for inspection
 let ws = null;
 let starting = false;
 let ready = false;                 // logged in (session established)
+// A login alone is NOT a healthy session: Datakom allows one session per account,
+// so a competing login (a second backend instance, or the web portal) lets us log
+// in and then kicks us before live data flows. `healthy` flips true only once the
+// pump primes (live data actually streaming). The backoff/failure counters reset on
+// `healthy`, never on mere login — otherwise a session-kick loop resets every cycle
+// and hammers the portal at the 5 s floor forever instead of backing off.
+let healthy = false;               // reached live-data steady state (pump primed)
 let session = null;                // { Access, ComNam }
 let connectedAt = null;
 let lastError = null;
 let reconnectDelay = RECONNECT_MIN_MS;
 let repumpTimer = null;
 let reconnectTimer = null;         // pending scheduleReconnect timeout (cancellable)
-let failedCycles = 0;              // consecutive connects that never reached login
+let failedCycles = 0;              // consecutive connects that never became healthy
 let gaveUp = false;                // stopped reconnecting to avoid hammering the server
 let stopped = false;               // explicitly stopped via stop() — no reconnects
 // Runtime enable override (null = follow env DK_ENABLED). Persisted by index.js
@@ -308,9 +315,9 @@ function handleMessage(buf) {
       session = { Access: access, ComNam: msg.ComNam ?? null };
       ready = true;
       lastError = null;
-      // Only a SUCCESSFUL login resets the backoff/failure counters.
-      reconnectDelay = RECONNECT_MIN_MS;
-      failedCycles = 0;
+      // NOTE: login does NOT reset the backoff — only a healthy session (pump
+      // primed, see devx_pump below) does. This is what stops a competing-session
+      // kick loop from resetting every cycle and hammering the portal.
       console.log(`[Datakom] ✓ Logged in (Access=${access})`);
       // The server pushes node_list next on its own; nothing to send here.
       return;
@@ -360,6 +367,12 @@ function handleMessage(buf) {
     //    poll each device's values, and keep polling on a cadence for live data.
     case 'devx_pump': {
       if (Number(msg.job) >= 2) {
+        // Steady state reached — this is the only place the backoff resets, so a
+        // connection that never gets here (e.g. kicked by a competing session) keeps
+        // counting as a failed cycle and backs off instead of looping at the floor.
+        healthy = true;
+        failedCycles = 0;
+        reconnectDelay = RECONNECT_MIN_MS;
         if (CFG.verbose) console.log(`[Datakom] Pump primed — live push active for ${devicesById.size} device(s)`);
         if (repumpTimer) clearInterval(repumpTimer);
         repumpTimer = setInterval(reprimePump, REPUMP_MS);
@@ -403,22 +416,28 @@ function connect() {
   ws.on('message', handleMessage);
 
   ws.on('close', (code) => {
-    const wasReady = ready;
+    const wasHealthy = healthy;
     ready = false;
+    healthy = false;
     if (repumpTimer) { clearInterval(repumpTimer); repumpTimer = null; }
 
     // Explicit stop(): don't count a failure, don't reconnect.
     if (stopped) return;
 
-    if (wasReady) failedCycles = 0; else failedCycles += 1;
+    // Only a healthy session (that actually streamed live data) clears the failure
+    // count. A connect that logged in but dropped before the pump primed still
+    // counts, so a session-kick loop backs off instead of hammering the portal.
+    if (wasHealthy) failedCycles = 0; else failedCycles += 1;
 
     if (failedCycles >= MAX_FAILED_CYCLES) {
       gaveUp = true;
       console.error(
-        `[Datakom] Stopped after ${failedCycles} failed attempts with no successful login ` +
-        `(last close code ${code}). NOT reconnecting — port 464 is IP-allowlisted by Datakom, ` +
-        `so an ECONNRESET here usually means this host's public IP is not whitelisted. ` +
-        `Confirm the IP is whitelisted, then restart to retry.`
+        `[Datakom] Stopped after ${failedCycles} attempts that never reached a live session ` +
+        `(last close code ${code}). NOT reconnecting. Likely causes: (a) another session is ` +
+        `using the same DK_USER account — a second backend instance or the Rainbow web portal — ` +
+        `and keeps kicking this one; or (b) this host's public IP is not whitelisted for the ` +
+        `IP-allowlisted port 464 (an ECONNRESET before login points here). Resolve the conflict, ` +
+        `then restart or POST /api/brands/datakom/adapter/restart to retry.`
       );
       return;
     }
@@ -460,6 +479,7 @@ function start() {
   if (starting && ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   stopped = false;
   gaveUp = false;
+  healthy = false;
   failedCycles = 0;
   reconnectDelay = RECONNECT_MIN_MS;
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
@@ -474,6 +494,7 @@ function stop() {
   stopped = true;
   starting = false;
   ready = false;
+  healthy = false;
   session = null;
   if (repumpTimer)    { clearInterval(repumpTimer);   repumpTimer = null; }
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
@@ -497,6 +518,7 @@ function getStatus() {
     url:         CFG.url,
     push:        CFG.push,
     ready,
+    healthy,
     stopped,
     gaveUp,
     connectedAt,

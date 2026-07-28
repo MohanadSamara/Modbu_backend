@@ -3,8 +3,7 @@
  *
  * Live telemetry push over WebSocket, so the frontend gets real-time fuel /
  * consumption / alarm / GPS updates instead of polling /api/modbus/fuel on a
- * timer. This is the *client* tunnel (browsers), distinct from remote-hub.js's
- * /agent-tunnel (site agents dialing in).
+ * timer. This is the browser-facing WebSocket stream.
  *
  * Auth: browsers can't set an Authorization header on a WebSocket, so the
  * short-lived access JWT is passed as ?token=… on the connect URL and verified
@@ -47,11 +46,9 @@ async function filterToVisible(userId, ids) {
 }
 
 function attach(server) {
-  // Use noServer + manual upgrade routing instead of { server, path }. When
-  // several WebSocketServers share one HTTP server via the `server` option,
-  // each registers its own 'upgrade' listener and destroys sockets whose path
-  // it doesn't own — killing the other server's connections. Claiming only our
-  // own path here lets this stream and remote-hub's tunnel coexist.
+  // Use noServer + manual upgrade routing instead of { server, path } so this
+  // stream only claims its own upgrade path and ignores any other, rather than
+  // destroying sockets it doesn't own.
   const wss = new WebSocketServer({ noServer: true });
 
   server.on('upgrade', (req, socket, head) => {

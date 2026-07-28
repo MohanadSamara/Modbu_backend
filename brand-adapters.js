@@ -2,9 +2,9 @@
  * brand-adapters.js
  *
  * The platform is multi-brand: each device row carries a brand (devices.brand_id
- * → brands.brand_name). Most brands are read over Modbus (direct TCP or via a
- * site agent — see device-io.js). A few brands expose their own cloud/portal
- * data source instead. This registry is the seam that maps a brand NAME to its
+ * → brands.brand_name). Most brands are read over Modbus (direct TCP — see
+ * modbus_connect.js). A few brands expose their own cloud/portal data source
+ * instead. This registry is the seam that maps a brand NAME to its
  * read-only adapter, so adding another brand later is just:
  *
  *     const acme = require('./acme-cloud');

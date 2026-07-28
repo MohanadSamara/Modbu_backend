@@ -1,5 +1,6 @@
 const express = require('express');
 const readline = require('readline');
+const singleInstance = require('./single-instance');
 
 // CLI-only globals: which device the interactive menu is pointed at. HTTP
 // requests are per-device (addressed by ?device_id=) and never rely on these.
@@ -15,15 +16,12 @@ let lastConnectAttemptAt = 0;
 const deviceSnoozes = new Map();
 
 require('dotenv').config();
-// device-io is a thin facade over modbus_connect (direct TCP) + remote-hub
-// (reverse tunnel to site agents). Same function surface — a device is served
-// over the tunnel when an agent for it is connected, else via direct TCP.
-const { connectModbus, disconnectModbus, closeAll, getSession, isConnected, stopButton, startButton, readFuel, readGps, readRegisters, readTelemetry, getDeviceConfig } = require('./device-io');
-const remoteHub = require('./remote-hub');
+// Direct Modbus TCP to devices on a network this server can reach.
+const { connectModbus, disconnectModbus, closeAll, getSession, isConnected, stopButton, startButton, readFuel, readGps, readRegisters, readTelemetry, getDeviceConfig } = require('./modbus_connect');
 const telemetryWs = require('./telemetry-ws');
 const { bucketEvents } = require('./lib/telemetry-math');
 // Per-brand read-only data sources (e.g. Datakom Rainbow over WebSocket). Modbus
-// brands don't use this — they're read via device-io. See brand-adapters.js.
+// brands don't use this — they're read via modbus_connect. See brand-adapters.js.
 const brandAdapters = require('./brand-adapters');
 
 // Build a per-device target ({ deviceId | ip, port }) from request query params.
@@ -2763,7 +2761,7 @@ async function ensureAckTable() {
     // after every API route, so real endpoints always win.
     app.use((req, res, next) => {
       if (req.method !== 'GET') return next();
-      if (req.path.startsWith('/api/') || req.path.startsWith('/ws/') || req.path === '/agent-tunnel') return next();
+      if (req.path.startsWith('/api/') || req.path.startsWith('/ws/')) return next();
       res.sendFile(FRONTEND_INDEX);
     });
     console.log(`[Startup] Serving frontend from ${FRONTEND_DIR}`);
@@ -2771,6 +2769,22 @@ async function ensureAckTable() {
 }
 
 (async () => {
+  // Refuse to start if another backend instance is already running on this port.
+  // Two instances would fight over the single-session Datakom cloud connection
+  // (see single-instance.js), so fail fast with a clear message instead.
+  const lock = singleInstance.acquire(PORT);
+  if (!lock.ok) {
+    console.error(
+      `[Startup] Another backend instance is already running on port ${PORT} ` +
+      `(PID ${lock.holderPid ?? 'unknown'}). Refusing to start a second instance — ` +
+      `two would kick each other off the single-session Datakom cloud connection. ` +
+      `Stop the running instance first, then retry.`
+    );
+    process.exit(1);
+  }
+  // Release the lock on exit so a clean shutdown lets the next start proceed.
+  process.on('exit', () => singleInstance.release(PORT));
+
   // Initialise the DB connection pool before accepting requests.
   // If the DB is unreachable at startup the server still starts —
   // the pool will retry automatically on first getConnection() call.
@@ -2832,10 +2846,6 @@ async function ensureAckTable() {
     console.log(`[Startup] Server listening on port ${PORT}`);
   });
 
-  // Attach the reverse-tunnel WebSocket endpoint (/agent-tunnel) so remote site
-  // agents can dial in and serve their local devices to this server.
-  remoteHub.attach(server);
-
   // Attach the browser-facing live telemetry stream (/ws/telemetry) so the
   // frontend can subscribe to real-time fuel/alarm/GPS updates instead of polling.
   telemetryWs.attach(server);
@@ -2864,6 +2874,7 @@ async function ensureAckTable() {
     server.close(async () => {
       await closeAll().catch(() => {});   // close every Modbus device hub
       await closePool();
+      singleInstance.release(PORT);       // free the lock for the next start
       console.log('[Shutdown] Done.');
       process.exit(0);
     });
