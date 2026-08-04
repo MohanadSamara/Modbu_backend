@@ -22,8 +22,10 @@ build/
 # Lock file (optional — keep if you want reproducible installs)
 # package-lock.json
 
-# Deployment artifacts (built frontend + DB dumps stay out of git)
-deploy/www/
+# Deployment artifacts (DB dumps stay out of git)
+# deploy/www/ is intentionally NOT ignored — Railway builds straight from this
+# repo with no access to the separate frontend repo, so the built frontend
+# (npm run build:frontend) must be committed for the backend to serve it.
 deploy/db-dump/
 s.out
 s.err
