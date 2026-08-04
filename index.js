@@ -1821,7 +1821,14 @@ app.get('/api/locations/:id/children', authenticate, requireAnyPermission(['proj
 // trip (three bulk queries), instead of the frontend fetching locations per
 // project and devices per location (1 + P + L requests for P projects and L
 // locations). Returns flat arrays; the frontend nests them by parent_id.
-app.get('/api/project-tree', authenticate, requirePermission('project.read'), async (req, res) => {
+//
+// No requirePermission gate: this replaces three endpoints (GET /api/projects,
+// GET /api/projects/:id/locations, GET /api/devices) that only ever required
+// being authenticated — a fuel.read-only or device.read-only user still needs
+// to browse the tree to reach their devices. Actual visibility is enforced by
+// the scope filters below (visibleProjects/visibleLocationIds/filterVisibleDevices),
+// same as those three endpoints always did.
+app.get('/api/project-tree', authenticate, async (req, res) => {
   try {
     const { global, ids } = await visibleProjects(req.user.id);
 
