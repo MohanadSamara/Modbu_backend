@@ -74,6 +74,32 @@ async function locationsOfDevices(devSet) {
   }));
 }
 
+// A project can contain other projects (container/folder nesting via
+// parent_id — see Projects.jsx). Expands each id in `projectIds` to include
+// every descendant project, so a grant on a container also covers what's
+// nested inside it — matching the "project grant sees its whole subtree"
+// contract documented at the top of this file.
+async function withDescendantProjects(projectIds) {
+  const ids = new Set(projectIds);
+  if (ids.size === 0) return ids;
+  const rows = await query(`SELECT id, parent_id FROM projects`);
+  const childrenOf = new Map(); // parent_id -> [child ids]
+  for (const r of rows) {
+    const parentId = r.PARENT_ID != null ? Number(r.PARENT_ID) : null;
+    if (parentId == null) continue;
+    if (!childrenOf.has(parentId)) childrenOf.set(parentId, []);
+    childrenOf.get(parentId).push(Number(r.ID));
+  }
+  const stack = [...ids];
+  while (stack.length) {
+    const cur = stack.pop();
+    for (const child of childrenOf.get(cur) || []) {
+      if (!ids.has(child)) { ids.add(child); stack.push(child); }
+    }
+  }
+  return ids;
+}
+
 // ── Projects the user may see ──────────────────────────────────────────────
 // Returns { global:true } (see all) or { global:false, ids:Set<number> }.
 async function visibleProjects(userId) {
@@ -82,7 +108,7 @@ async function visibleProjects(userId) {
   const ids = new Set(s.projects);
   (await projectsOfLocations(s.locations)).forEach(p => ids.add(p));
   (await locationsOfDevices(s.devices)).forEach(x => { if (x.projectId) ids.add(x.projectId); });
-  return { global: false, ids };
+  return { global: false, ids: await withDescendantProjects(ids) };
 }
 
 // ── Locations the user may see inside one project ──────────────────────────
@@ -90,7 +116,9 @@ async function visibleProjects(userId) {
 // Returns null → all visible, or a Set of visible location ids (may be empty).
 async function visibleLocationIds(userId, projectId, items) {
   const s = await getUserScope(userId);
-  if (s.global || s.projects.has(projectId)) return null; // whole project visible
+  if (s.global) return null;
+  const grantedProjects = await withDescendantProjects(s.projects);
+  if (grantedProjects.has(projectId)) return null; // whole project visible (directly granted or a descendant of one)
 
   const byId = new Map(items.map(it => [it.ID, it]));
   const visible = new Set();
@@ -132,6 +160,7 @@ async function visibleLocationIds(userId, projectId, items) {
 async function filterVisibleDevices(userId, rows) {
   const s = await getUserScope(userId);
   if (s.global) return rows;
+  const grantedProjects = await withDescendantProjects(s.projects);
 
   // Cache location → { projectId, ancestorLocIds } to avoid repeat lookups.
   const locCache = new Map();
@@ -163,7 +192,7 @@ async function filterVisibleDevices(userId, rows) {
     if (did != null && s.devices.has(did)) { out.push(row); continue; }  // granted device
     if (lid == null) continue;
     const info = await locInfo(lid);
-    if (info.projectId && s.projects.has(info.projectId)) { out.push(row); continue; } // project grant
+    if (info.projectId && grantedProjects.has(info.projectId)) { out.push(row); continue; } // project grant (or its container)
     if ([...info.ancestors].some(a => s.locations.has(a)))  { out.push(row); continue; } // location grant covers it
   }
   return out;
