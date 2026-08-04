@@ -356,6 +356,48 @@ router.post('/users/:id/roles', requirePermission('user.assign_role'), async (re
   }
 });
 
+// ── PUT /api/users/:id/roles/:userRoleId — re-point an assignment's target ──
+// Updates the scope (project/location/device) of an EXISTING assignment in
+// place, in a single statement — atomic, so a failure can never leave the user
+// with the role silently revoked and not re-granted (the old revoke-then-
+// recreate approach could do exactly that).
+router.put('/users/:id/roles/:userRoleId', requirePermission('user.assign_role'), async (req, res) => {
+  const id   = parseInt(req.params.id);
+  const urid = parseInt(req.params.userRoleId);
+  if (!Number.isInteger(id) || !Number.isInteger(urid)) {
+    return res.status(400).json({ error: 'Invalid id' });
+  }
+  const { projectId, locationId, deviceId } = req.body || {};
+  const provided = [projectId, locationId, deviceId].filter(v => v !== undefined && v !== null && v !== '');
+  if (provided.length > 1) {
+    return res.status(400).json({ error: 'Provide only one of projectId, locationId, or deviceId' });
+  }
+  try {
+    const r = await execute(
+      `UPDATE user_roles
+          SET project_id = :projectId, location_id = :locationId, device_id = :deviceId
+        WHERE user_role_id = :urid AND user_id = :id`,
+      {
+        projectId:  projectId  ? Number(projectId)  : null,
+        locationId: locationId ? Number(locationId) : null,
+        deviceId:   deviceId   ? Number(deviceId)   : null,
+        urid, id,
+      }
+    );
+    if ((r.rowsAffected || 0) === 0) return res.status(404).json({ error: 'Role assignment not found' });
+    invalidateUserPermsCache(id);
+    res.json({ success: true });
+  } catch (e) {
+    if (/unique constraint/i.test(e.message)) {
+      return res.status(409).json({ error: 'User already has that role with that scope' });
+    }
+    if (e.code === '23503') {
+      return res.status(400).json({ error: 'Invalid project_id, location_id, or device_id' });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── DELETE /api/users/:id/roles/:userRoleId — revoke role ─────────────────
 router.delete('/users/:id/roles/:userRoleId', requirePermission('user.assign_role'), async (req, res) => {
   const id  = parseInt(req.params.id);

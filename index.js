@@ -1817,12 +1817,87 @@ app.get('/api/locations/:id/children', authenticate, requireAnyPermission(['proj
   }
 });
 
-// Project tree view
+// Project tree view — the whole projects/locations/devices tree in ONE round
+// trip (three bulk queries), instead of the frontend fetching locations per
+// project and devices per location (1 + P + L requests for P projects and L
+// locations). Returns flat arrays; the frontend nests them by parent_id.
 app.get('/api/project-tree', authenticate, requirePermission('project.read'), async (req, res) => {
   try {
-    const rows = await query('SELECT * FROM v_project_tree');
-    res.json(rows);
+    const { global, ids } = await visibleProjects(req.user.id);
+
+    let projects;
+    if (global) {
+      projects = await query(
+        `SELECT p.id, p.name, p.description, p.created_at, p.updated_at,
+                p.brand_id, p.method, p.parent_id, b.brand_name
+           FROM projects p
+           LEFT JOIN brands b ON b.brand_id = p.brand_id
+          ORDER BY p.id`
+      );
+    } else if (ids.size === 0) {
+      projects = [];
+    } else {
+      const arr = [...ids];
+      const binds = {};
+      const placeholders = arr.map((v, i) => { binds[`p${i}`] = v; return `:p${i}`; });
+      projects = await query(
+        `SELECT p.id, p.name, p.description, p.created_at, p.updated_at,
+                p.brand_id, p.method, p.parent_id, b.brand_name
+           FROM projects p
+           LEFT JOIN brands b ON b.brand_id = p.brand_id
+          WHERE p.id IN (${placeholders.join(', ')})
+          ORDER BY p.id`,
+        binds
+      );
+    }
+
+    const projectIds = projects.map((p) => p.ID);
+    let locations = [];
+    if (projectIds.length) {
+      if (global) {
+        locations = await query(
+          `SELECT id, project_id, parent_id, name, description, address, created_at, updated_at
+             FROM locations
+            WHERE project_id = ANY(:ids)
+            ORDER BY name`,
+          [projectIds]
+        );
+      } else {
+        // Scoped users may hold a grant on just one location/device inside a
+        // project, not the whole project — filter each project's locations
+        // down to that grant's visible subtree (visibleLocationIds already
+        // does this per-project; only scoped users pay this per-project cost).
+        for (const pid of projectIds) {
+          const projLocations = await query(
+            `SELECT id, project_id, parent_id, name, description, address, created_at, updated_at
+               FROM locations WHERE project_id = :pid ORDER BY name`,
+            { pid }
+          );
+          const visibleIds = await visibleLocationIds(req.user.id, pid, projLocations);
+          locations.push(...(visibleIds ? projLocations.filter((l) => visibleIds.has(l.ID)) : projLocations));
+        }
+      }
+    }
+
+    const locationIds = locations.map((l) => l.ID);
+    let devices = [];
+    if (locationIds.length) {
+      const deviceRows = await query(
+        `SELECT d.device_id AS id, d.device_name AS name, d.device_ip AS ip, d.device_port AS port,
+                d.status, d.location_id, d.latitude, d.longitude, d.altitude, d.last_seen,
+                d.brand_id, d.datakom_did, b.brand_name
+           FROM devices d
+           LEFT JOIN brands b ON b.brand_id = d.brand_id
+          WHERE d.location_id = ANY(:ids)
+          ORDER BY d.device_name`,
+        [locationIds]
+      );
+      devices = reconcileDeviceRows(await filterVisibleDevices(req.user.id, deviceRows));
+    }
+
+    res.json({ projects, locations, devices });
   } catch (e) {
+    console.error('GET /api/project-tree error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
