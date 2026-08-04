@@ -15,7 +15,19 @@
  */
 
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const router = express.Router();
+
+// Per-IP brute-force throttle on login, on top of the per-account lockout in
+// auth.js (recordFailedLogin) — the lockout stops repeated guesses against ONE
+// account, this stops one IP from grinding through many accounts.
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts. Try again later.' },
+});
 
 const {
   hashPassword,
@@ -46,7 +58,7 @@ function _meta(req) {
 }
 
 // ── POST /api/auth/login ──────────────────────────────────────────────────
-router.post('/login', async (req, res) => {
+router.post('/login', loginLimiter, async (req, res) => {
   const { login, password } = req.body || {};
   const { ip, userAgent } = _meta(req);
 

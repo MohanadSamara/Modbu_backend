@@ -43,7 +43,22 @@ const userRoutes  = require('./routes-users');
 const { authenticate, requirePermission, requireAnyPermission, requirePermissionIfBodyPresent, optionalAuthenticate, enforceMappedPermissions } = require('./middleware');
 const { visibleProjects, visibleLocationIds, filterVisibleDevices } = require('./nav-scope');
 const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
 const app = express();
+
+// Railway (and Cloudflare in front of it) sit between the client and this
+// process, so req.ip would otherwise be the proxy's address — trust the
+// nearest hop's X-Forwarded-For so rate limiting and audit-log IPs reflect
+// the real client.
+app.set('trust proxy', 1);
+
+// Security headers. CSP is left off: the frontend loads Google Fonts from
+// fonts.googleapis.com/fonts.gstatic.com, and helmet's default CSP would
+// block that unless explicitly allow-listed — the other headers (frame
+// protection, MIME sniffing, HSTS) are worth having without that risk.
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(compression());
 
 // Support --port <n> passed via CLI (e.g. npm run dev -- --port 5400)
 const _cliArgs = process.argv.slice(2);
@@ -2920,4 +2935,16 @@ async function ensureAckTable() {
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT',  () => shutdown('SIGINT'));
+
+  // Last-resort safety net: log the full error before Node's default handler
+  // takes over. Without these, an error thrown outside an Express route
+  // handler (e.g. inside a setInterval callback or an unawaited promise)
+  // crashes the process with no context in the logs.
+  process.on('uncaughtException', (err) => {
+    console.error('[FATAL] Uncaught exception:', err);
+    shutdown('uncaughtException');
+  });
+  process.on('unhandledRejection', (reason) => {
+    console.error('[FATAL] Unhandled promise rejection:', reason);
+  });
 })();
