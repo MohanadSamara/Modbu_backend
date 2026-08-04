@@ -6,7 +6,6 @@ agent
 .env.*
 s.out
 s.err
-deploy/www
 deploy/db-dump
 test
 *.md
