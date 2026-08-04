@@ -1,0 +1,47 @@
+name: CI
+
+# Runs on every push and PR to main. This is checks only — it does not deploy
+# anything. Railway has its own GitHub integration that deploys main on push;
+# this workflow exists to catch a broken build/test *before* that happens.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax-check every source file
+        run: |
+          for f in $(git ls-files '*.js' | grep -v node_modules); do
+            node -c "$f"
+          done
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Audit dependencies (fail on high/critical)
+        run: npm audit --audit-level=high
+
+  docker-build:
+    runs-on: ubuntu-latest
+    # Confirms the Dockerfile that Railway builds from still produces a working
+    # image — catches issues like a .dockerignore accidentally excluding a
+    # file the app needs at runtime (deploy/www, specifically, has bitten this
+    # project before).
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t modbus-backend:ci .
