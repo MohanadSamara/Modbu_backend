@@ -28,7 +28,6 @@
  * Config: DK_SYNC_MS (default 10 min, min 1 min) — cadence between syncs.
  */
 
-const oracledb = require('oracledb');
 const { getConnection, getDatakomNodeNames, getDatakomNodeContainers } = require('./db');
 const datakom = require('./datakom-rainbow');
 
@@ -57,11 +56,11 @@ function getSyncStatus() {
 
 // ── Small SQL helpers on a shared connection (autoCommit off) ───────────────
 async function q(conn, sql, binds = {}) {
-  const r = await conn.execute(sql, binds, { outFormat: oracledb.OUT_FORMAT_OBJECT });
+  const r = await conn.execute(sql, binds);
   return r.rows || [];
 }
 
-const isUnique = (e) => /ORA-00001|unique constraint/i.test(e?.message || '');
+const isUnique = (e) => e?.code === '23505';
 
 // Insert an entity whose name must be unique; on a name collision retry with
 // " (Datakom)" and then " (<tag>)" so one clash never fails the whole run.
@@ -78,16 +77,15 @@ async function insertWithNameFallback(conn, tag, baseName, tryInsert) {
 // ── Entity creators (each commits together with its map row) ────────────────
 async function createProject(conn, summary, { nodeKey, name, brandId, parentId }) {
   const out = await insertWithNameFallback(conn, nodeKey, name, async (nm) => conn.execute(
-    `INSERT INTO MODBUS_ADMIN.projects (name, description, brand_id, method, parent_id)
+    `INSERT INTO projects (name, description, brand_id, method, parent_id)
      VALUES (:name, NULL, :brandId, :method, :parentId)
-     RETURNING id INTO :id`,
-    { name: nm, brandId, method: brandId != null ? 'cloud' : 'ip', parentId,
-      id: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER } },
+     RETURNING id`,
+    { name: nm, brandId, method: brandId != null ? 'cloud' : 'ip', parentId },
     { autoCommit: false }
   ));
-  const id = out.outBinds.id[0];
+  const id = out.rows[0].ID;
   await conn.execute(
-    `INSERT INTO MODBUS_ADMIN.datakom_node_map (node_key, entity_type, entity_id)
+    `INSERT INTO datakom_node_map (node_key, entity_type, entity_id)
      VALUES (:nodeKey, 'project', :id)`,
     { nodeKey, id }, { autoCommit: false }
   );
@@ -98,16 +96,15 @@ async function createProject(conn, summary, { nodeKey, name, brandId, parentId }
 
 async function createLocation(conn, summary, { nodeKey, name, projectId, parentLocationId }) {
   const out = await insertWithNameFallback(conn, nodeKey, name, async (nm) => conn.execute(
-    `INSERT INTO MODBUS_ADMIN.locations (project_id, name, description, address, parent_id)
+    `INSERT INTO locations (project_id, name, description, address, parent_id)
      VALUES (:projectId, :name, NULL, NULL, :parentId)
-     RETURNING id INTO :id`,
-    { projectId, name: nm, parentId: parentLocationId,
-      id: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER } },
+     RETURNING id`,
+    { projectId, name: nm, parentId: parentLocationId },
     { autoCommit: false }
   ));
-  const id = out.outBinds.id[0];
+  const id = out.rows[0].ID;
   await conn.execute(
-    `INSERT INTO MODBUS_ADMIN.datakom_node_map (node_key, entity_type, entity_id)
+    `INSERT INTO datakom_node_map (node_key, entity_type, entity_id)
      VALUES (:nodeKey, 'location', :id)`,
     { nodeKey, id }, { autoCommit: false }
   );
@@ -123,17 +120,17 @@ async function createDevice(conn, summary, nextDeviceId, dev, locationId, brandI
   const lng = Number.isFinite(Number(dev.lng)) ? Number(dev.lng) : null;
   const ip  = dev.ip || null; // cloud-reported IP, if the device reports one
   await conn.execute(
-    `INSERT INTO MODBUS_ADMIN.DEVICES
+    `INSERT INTO devices
        (device_id, device_name, device_ip, device_port, status, location_id,
         brand_id, datakom_did, latitude, longitude${lat != null || lng != null ? ', gps_updated_at' : ''})
      VALUES
        (:deviceId, :name, :ip, 502, 'offline', :locationId,
-        :brandId, :did, :lat, :lng${lat != null || lng != null ? ', SYSTIMESTAMP' : ''})`,
+        :brandId, :did, :lat, :lng${lat != null || lng != null ? ', NOW()' : ''})`,
     { deviceId, name, ip, locationId, brandId, did: dev.did, lat, lng },
     { autoCommit: false }
   );
   await conn.execute(
-    `INSERT INTO MODBUS_ADMIN.datakom_did_map (did, device_id) VALUES (:did, :deviceId)`,
+    `INSERT INTO datakom_did_map (did, device_id) VALUES (:did, :deviceId)`,
     { did: dev.did, deviceId }, { autoCommit: false }
   );
   await conn.commit();
@@ -159,23 +156,23 @@ async function runSync() {
     // Existing anchors: node_key|entity_type → entity_id, and the set of
     // already-imported dids (tombstones included).
     const nodeMap = new Map();
-    for (const r of await q(conn, `SELECT node_key, entity_type, entity_id FROM MODBUS_ADMIN.datakom_node_map`)) {
+    for (const r of await q(conn, `SELECT node_key, entity_type, entity_id FROM datakom_node_map`)) {
       nodeMap.set(`${r.NODE_KEY}|${r.ENTITY_TYPE}`, Number(r.ENTITY_ID));
     }
-    const didRows = await q(conn, `SELECT did, device_id FROM MODBUS_ADMIN.datakom_did_map`);
+    const didRows = await q(conn, `SELECT did, device_id FROM datakom_did_map`);
     const knownDids = new Map(didRows.map((r) => [Number(r.DID), r.DEVICE_ID == null ? null : Number(r.DEVICE_ID)]));
 
     // A did already linked to ANY existing device row (e.g. manually created
     // before the sync existed) counts as imported — never auto-create a
     // duplicate of a device the user already added. Backfill the map so the
     // rule also holds after that device is later deleted (tombstone).
-    const linkedRows = await q(conn, `SELECT device_id, datakom_did FROM MODBUS_ADMIN.DEVICES WHERE datakom_did IS NOT NULL`);
+    const linkedRows = await q(conn, `SELECT device_id, datakom_did FROM devices WHERE datakom_did IS NOT NULL`);
     for (const r of linkedRows) {
       const did = Number(r.DATAKOM_DID);
       if (!knownDids.has(did)) {
         try {
           await conn.execute(
-            `INSERT INTO MODBUS_ADMIN.datakom_did_map (did, device_id) VALUES (:did, :deviceId)`,
+            `INSERT INTO datakom_did_map (did, device_id) VALUES (:did, :deviceId)`,
             { did, deviceId: Number(r.DEVICE_ID) }, { autoCommit: true }
           );
           knownDids.set(did, Number(r.DEVICE_ID));
@@ -184,8 +181,8 @@ async function runSync() {
     }
 
     // Live entity sets — a mapped id whose row is gone is a user delete (tombstone).
-    const liveProjects  = new Set((await q(conn, `SELECT id FROM MODBUS_ADMIN.projects`)).map((r) => Number(r.ID)));
-    const liveLocations = new Set((await q(conn, `SELECT id FROM MODBUS_ADMIN.locations`)).map((r) => Number(r.ID)));
+    const liveProjects  = new Set((await q(conn, `SELECT id FROM projects`)).map((r) => Number(r.ID)));
+    const liveLocations = new Set((await q(conn, `SELECT id FROM locations`)).map((r) => Number(r.ID)));
 
     // Legacy read-only-tree customisations (seed names/folders on first import).
     const legacyNames      = await getDatakomNodeNames().catch(() => ({}));
@@ -194,18 +191,18 @@ async function runSync() {
 
     // Datakom brand row (create once if missing).
     let brandId = null;
-    const brandRows = await q(conn, `SELECT brand_id, brand_name FROM MODBUS_ADMIN.brands`);
+    const brandRows = await q(conn, `SELECT brand_id, brand_name FROM brands`);
     for (const b of brandRows) if (/data[ck]om/i.test(String(b.BRAND_NAME))) { brandId = Number(b.BRAND_ID); break; }
     if (brandId == null) {
       const out = await conn.execute(
-        `INSERT INTO MODBUS_ADMIN.brands (brand_name) VALUES ('Datakom') RETURNING brand_id INTO :id`,
-        { id: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER } }, { autoCommit: true }
+        `INSERT INTO brands (brand_name) VALUES ('Datakom') RETURNING brand_id`,
+        [], { autoCommit: true }
       );
-      brandId = out.outBinds.id[0];
+      brandId = out.rows[0].BRAND_ID;
     }
 
-    // Manual device-id allocator (DEVICES has no identity column).
-    const maxRow = await q(conn, `SELECT NVL(MAX(device_id), 0) AS MAX_ID FROM MODBUS_ADMIN.DEVICES`);
+    // Manual device-id allocator (devices has no identity column).
+    const maxRow = await q(conn, `SELECT COALESCE(MAX(device_id), 0) AS MAX_ID FROM devices`);
     let devIdCursor = Number(maxRow[0]?.MAX_ID ?? 0);
     const nextDeviceId = () => (devIdCursor += 1);
 
@@ -303,8 +300,8 @@ async function runSync() {
           const lat = Number(dev.lat), lng = Number(dev.lng);
           if (deviceId != null && Number.isFinite(lat) && Number.isFinite(lng)) {
             const r = await conn.execute(
-              `UPDATE MODBUS_ADMIN.DEVICES
-                  SET latitude = :lat, longitude = :lng, gps_updated_at = SYSTIMESTAMP
+              `UPDATE devices
+                  SET latitude = :lat, longitude = :lng, gps_updated_at = NOW()
                 WHERE device_id = :deviceId AND latitude IS NULL AND longitude IS NULL`,
               { lat, lng, deviceId }, { autoCommit: true }
             );

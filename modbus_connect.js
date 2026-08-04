@@ -140,10 +140,10 @@ async function getTimeoutMs() {
   if (!conn) return _cachedTimeoutMs ?? DEFAULT_TIMEOUT;
   try {
     const result = await conn.execute(
-      "SELECT setting_value FROM MODBUS_ADMIN.system_settings WHERE setting_key = 'CONNECTION_TIMEOUT'"
+      "SELECT setting_value FROM system_settings WHERE setting_key = 'CONNECTION_TIMEOUT'"
     );
     if (result.rows?.length > 0) {
-      const val = parseInt(result.rows[0][0]);
+      const val = parseInt(result.rows[0].SETTING_VALUE);
       if (!isNaN(val) && val > 0) { _cachedTimeoutMs = val; _cachedTimeoutAt = Date.now(); return val; }
     }
   } catch { /* ignore */ } finally {
@@ -170,24 +170,24 @@ async function getDeviceConfig(deviceId = null) {
     let result;
     if (deviceId) {
       result = await connection.execute(
-        'SELECT device_id, device_ip, device_port, device_name FROM MODBUS_ADMIN.devices WHERE device_id = :id',
+        'SELECT device_id, device_ip, device_port, device_name FROM devices WHERE device_id = :id',
         { id: parseInt(deviceId) }
       );
     } else {
       result = await connection.execute(
         `SELECT device_id, device_ip, device_port, device_name
-           FROM MODBUS_ADMIN.devices WHERE status = 'online'
+           FROM devices WHERE status = 'online'
           ORDER BY device_id FETCH FIRST 1 ROWS ONLY`, []
       );
       if (!result.rows?.length) {
         result = await connection.execute(
-          'SELECT device_id, device_ip, device_port, device_name FROM MODBUS_ADMIN.devices ORDER BY device_id FETCH FIRST 1 ROWS ONLY', []
+          'SELECT device_id, device_ip, device_port, device_name FROM devices ORDER BY device_id FETCH FIRST 1 ROWS ONLY', []
         );
       }
     }
     if (!result.rows?.length) { console.warn('[Modbus] No devices found in database'); return null; }
     const row = result.rows[0];
-    const config = { device_id: row[0], ip: row[1], port: parseInt(row[2]), name: row[3] || 'Unknown' };
+    const config = { device_id: row.DEVICE_ID, ip: row.DEVICE_IP, port: parseInt(row.DEVICE_PORT), name: row.DEVICE_NAME || 'Unknown' };
     console.log(`[Modbus] Device config: ${config.name} @ ${config.ip}:${config.port}`);
     return config;
   } catch (err) {

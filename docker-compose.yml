@@ -1,42 +1,38 @@
-# Full production stack: Oracle XE + Node backend + Caddy (HTTPS + frontend).
+# Full self-hosted stack: Postgres + Node backend + Caddy (HTTPS + frontend).
 # Copy deploy/env.production.example to .env on the server and fill it in,
 # then: docker compose up -d --build
+#
+# This is the self-hosted path. The live deployment (Neon + Railway) doesn't
+# use this file at all — Railway builds straight from the Dockerfile and Neon
+# is a separate managed Postgres, no "postgres" service needed there.
 services:
-  oracle:
-    image: gvenzl/oracle-xe:21
+  postgres:
+    image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      # SYS/SYSTEM password inside the container
-      ORACLE_PASSWORD: ${ORACLE_SYS_PASSWORD:?set ORACLE_SYS_PASSWORD in .env}
-      # Auto-create the app schema user on first start
-      APP_USER: MODBUS_ADMIN
-      APP_USER_PASSWORD: ${ORACLE_PASSWORD:?set ORACLE_PASSWORD in .env}
+      POSTGRES_USER: modbus
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: modbus
     volumes:
-      - oracle-data:/opt/oracle/oradata
-      # Drop your Data Pump export here to import it (see DEPLOY.md)
-      - ./deploy/db-dump:/dump
+      - postgres-data:/var/lib/postgresql/data
+      - ./migrations/postgres:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD", "healthcheck.sh"]
-      interval: 30s
-      timeout: 10s
-      retries: 20
-      start_period: 5m
+      test: ["CMD-SHELL", "pg_isready -U modbus"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   backend:
     build: .
     restart: unless-stopped
     env_file: .env
     environment:
-      # Inside the compose network the DB is the "oracle" service — these
-      # override whatever is in .env so the same file works everywhere.
-      ORACLE_HOST: oracle
-      ORACLE_PORT: "1521"
-      ORACLE_SERVICE_NAME: XEPDB1
-      ORACLE_USER: MODBUS_ADMIN
+      # Inside the compose network the DB is the "postgres" service.
+      DATABASE_URL: postgres://modbus:${POSTGRES_PASSWORD}@postgres:5432/modbus
       PORT: "5400"
       NODE_ENV: production
     depends_on:
-      oracle:
+      postgres:
         condition: service_healthy
 
   caddy:
@@ -56,6 +52,6 @@ services:
       - backend
 
 volumes:
-  oracle-data:
+  postgres-data:
   caddy-data:
   caddy-config:

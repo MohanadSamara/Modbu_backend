@@ -33,7 +33,6 @@ function targetFromReq(req) {
   const port = req.query.port ? parseInt(req.query.port) : undefined;
   return { deviceId, ip, port };
 }
-const oracledb = require('oracledb');
 const { initPool, closePool, getConnection, logDeviceAction, logFuelReading, getConsumptionRate, getFuelHistory, getEventTimes, checkFuelAlarms, ensureAlarmsTable, getActiveAlarms, acknowledgeAlarm, ensureSnoozeTable, getActiveSnoozes, setSnooze, ensureDatakomNodeNamesTable, getDatakomNodeNames, setDatakomNodeName, ensureDatakomNodeContainersTable, getDatakomNodeContainers, setDatakomNodeContainer, ensureProjectParentColumn, projectParentWouldCycle, ensurePageContentTable, getPageContent, savePageContent, ensureSettingsTables, ensureRbacSeed, ensureUiElementCatalog, ensureDatakomSyncTables, getSystemSetting, setSystemSetting } = require('./db');
 // Datakom cloud→DB sync job: materialises the Rainbow tree as editable
 // projects/locations/devices rows (see datakom-sync.js).
@@ -184,7 +183,7 @@ async function menuAddDevice() {
   if (conn) {
     try {
       await conn.execute(
-`INSERT INTO MODBUS_ADMIN.devices (device_id, device_name, device_ip, device_port, status) VALUES (:device_id, :device_name, :device_ip, :device_port, :status)`,
+`INSERT INTO devices (device_id, device_name, device_ip, device_port, status) VALUES (:device_id, :device_name, :device_ip, :device_port, :status)`,
         { device_id: id, device_name: name, device_ip: ip, device_port: port, status },
         { autoCommit: true }
       );
@@ -323,8 +322,8 @@ app.get('/api/events', authenticate, requirePermission('alarm.read'), async (_, 
   const conn = await getConnection();
   if (conn) {
     try {
-const r = await conn.execute('SELECT * FROM MODBUS_ADMIN.device_actions ORDER BY action_id DESC');
-      res.json(r.rows.map(row => ({id: row[0], device: row[1], type: row[2], time: row[3] || null, severity: 'info' })));
+const r = await conn.execute('SELECT * FROM device_actions ORDER BY action_id DESC');
+      res.json(r.rows.map(row => ({id: row.ACTION_ID, device: row.DEVICE_ID, type: row.ACTION_TYPE, time: row.ACTION_TIME || null, severity: 'info' })));
     } catch (e) {
       console.error('/api/events error:', e.message);
       res.json([]);
@@ -375,9 +374,9 @@ app.get('/api/stats', authenticate, requirePermission('device.read'), async (req
 // - GET /api/devices?project_id=X (filters by project)
 
 const CHILD_TABLES = [
-  'MODBUS_ADMIN.device_readings',
-  'MODBUS_ADMIN.device_actions',
-  'MODBUS_ADMIN.device_settings',
+  'device_readings',
+  'device_actions',
+  'device_settings',
 ];
 
 app.delete('/api/devices/:deviceId', authenticate, requirePermission('device.write'), async (req, res) => {
@@ -402,7 +401,7 @@ app.delete('/api/devices/:deviceId', authenticate, requirePermission('device.wri
     }
 
     const result = await conn.execute(
-      'DELETE FROM MODBUS_ADMIN.DEVICES WHERE device_id = :id',
+      'DELETE FROM devices WHERE device_id = :id',
       { id: deviceId }
     );
 
@@ -423,7 +422,7 @@ app.delete('/api/devices/:deviceId', authenticate, requirePermission('device.wri
       message: e.message
     });
 
-    if (/ORA-02292/i.test(e.message)) {
+    if (e.code === '23503') {
       return res.status(409).json({
         error: 'Device has related records and cannot be deleted. ' +
                'Remove dependent rows first or enable ON DELETE CASCADE.'
@@ -444,8 +443,8 @@ app.get('/api/device-actions', authenticate, requirePermission('alarm.read'), as
   const conn = await getConnection();
   if (conn) {
     try {
-const r = await conn.execute('SELECT * FROM MODBUS_ADMIN.device_actions ORDER BY action_id DESC');
-      res.json(r.rows.map(row => ({id: row[0], device: row[1], type: row[2], time: row[3] || null})));
+const r = await conn.execute('SELECT * FROM device_actions ORDER BY action_id DESC');
+      res.json(r.rows.map(row => ({id: row.ACTION_ID, device: row.DEVICE_ID, type: row.ACTION_TYPE, time: row.ACTION_TIME || null})));
     } catch (e) {
       console.error('GET /api/device-actions error:', e.message);
       res.status(500).json({ error: e.message });
@@ -599,11 +598,11 @@ async function getEffectiveThresholds(deviceId) {
     // System settings (overrides defaults)
     const sysRes = await conn.execute(
       `SELECT setting_key, setting_value, setting_type
-         FROM MODBUS_ADMIN.system_settings
+         FROM system_settings
         WHERE setting_key IN ('LOW_TANK_THRESHOLD','CRITICAL_TANK_THRESHOLD','CONSUMPTION_RATE_THRESHOLD','FUEL_ALERTS_ENABLED','ALARM_COOLDOWN_MINUTES')`
     );
     for (const row of sysRes.rows || []) {
-      const k = row[0], v = row[1];
+      const k = row.SETTING_KEY, v = row.SETTING_VALUE;
       if (k === 'LOW_TANK_THRESHOLD')         defaults.lowTank         = parseFloat(v);
       else if (k === 'CRITICAL_TANK_THRESHOLD')   defaults.criticalTank    = parseFloat(v);
       else if (k === 'CONSUMPTION_RATE_THRESHOLD') defaults.consumptionRate = parseFloat(v);
@@ -615,13 +614,13 @@ async function getEffectiveThresholds(deviceId) {
     if (deviceId) {
       const devRes = await conn.execute(
         `SELECT setting_key, setting_value
-           FROM MODBUS_ADMIN.device_settings
+           FROM device_settings
           WHERE device_id = :deviceId
             AND setting_key IN ('LOW_TANK_THRESHOLD','CRITICAL_TANK_THRESHOLD','CONSUMPTION_RATE_THRESHOLD','FUEL_ALERTS_ENABLED')`,
         { deviceId }
       );
       for (const row of devRes.rows || []) {
-        const k = row[0], v = row[1];
+        const k = row.SETTING_KEY, v = row.SETTING_VALUE;
         if (k === 'LOW_TANK_THRESHOLD')         defaults.lowTank         = parseFloat(v);
         else if (k === 'CRITICAL_TANK_THRESHOLD')   defaults.criticalTank    = parseFloat(v);
         else if (k === 'CONSUMPTION_RATE_THRESHOLD') defaults.consumptionRate = parseFloat(v);
@@ -838,8 +837,8 @@ async function setDeviceStatus(deviceId, status) {
   try {
     // Going online also refreshes last_seen (the device is reachable right now).
     const sql = status === 'online'
-      ? `UPDATE MODBUS_ADMIN.devices SET status = :status, last_seen = SYSTIMESTAMP WHERE device_id = :id`
-      : `UPDATE MODBUS_ADMIN.devices SET status = :status WHERE device_id = :id`;
+      ? `UPDATE devices SET status = :status, last_seen = NOW() WHERE device_id = :id`
+      : `UPDATE devices SET status = :status WHERE device_id = :id`;
     await execute(sql, { status, id: parseInt(deviceId) });
     console.log(`[Status] Device ${deviceId} -> ${status}`);
   } catch (e) {
@@ -873,7 +872,7 @@ async function refreshDidMap() {
   try {
     // query() resolves to the rows array itself (not a {rows} wrapper).
     const rows = await query(
-      `SELECT device_id, datakom_did FROM MODBUS_ADMIN.devices WHERE datakom_did IS NOT NULL`
+      `SELECT device_id, datakom_did FROM devices WHERE datakom_did IS NOT NULL`
     );
     _deviceIdToDid.clear();
     for (const r of (rows || [])) {
@@ -981,7 +980,7 @@ async function persistDeviceGps(deviceId, gps) {
   if (!deviceId || !gps || !gps.valid || !gps.hasFix) return;
   try {
     await execute(
-      `UPDATE MODBUS_ADMIN.devices
+      `UPDATE devices
           SET latitude = :lat, longitude = :lon, altitude = :alt, gps_updated_at = :ts
         WHERE device_id = :id`,
       { lat: gps.latitude, lon: gps.longitude, alt: gps.altitude, ts: new Date(), id: parseInt(deviceId) }
@@ -1152,7 +1151,7 @@ app.get('/api/consumption-rate/:deviceId', authenticate, requirePermission('fuel
 });
 
 // ── Recent alarms endpoint ────────────────────────────────────────────────
-// Reads the dedicated MODBUS_ADMIN.alarms table (every triggered alarm is saved
+// Reads the dedicated alarms table (every triggered alarm is saved
 // there), returning only UN-acknowledged rows. A row disappears as soon as the
 // user accepts it (POST /api/alarms/:id/acknowledge). Because checkFuelAlarms
 // uses a 5-min cooldown, a new alarm row appears after that cooldown if the
@@ -1170,7 +1169,7 @@ app.get('/api/alarms', authenticate, requirePermission('alarm.read'), async (req
 });
 
 // ── Acknowledge a specific alarm ─────────────────────────────────────────
-// Marks the alarm row acknowledged in MODBUS_ADMIN.alarms so GET /api/alarms
+// Marks the alarm row acknowledged in the alarms table so GET /api/alarms
 // hides it. Idempotent: acknowledging the same alarm twice is a no-op.
 // A NEW alarm row appears if checkFuelAlarms fires again for the same device
 // after the cooldown period (currently 5 min).
@@ -1274,11 +1273,11 @@ app.get('/api/alarms/live', authenticate, requirePermission('alarm.read'), async
       const placeholders = ids.map((id, i) => { binds[`d${i}`] = id; return `:d${i}`; });
       const r = await conn.execute(
         `SELECT device_id, device_name, location_id
-           FROM MODBUS_ADMIN.devices
+           FROM devices
           WHERE device_id IN (${placeholders.join(', ')})`,
         binds
       );
-      for (const row of r.rows || []) nameMap[row[0]] = { name: row[1], locationId: row[2] };
+      for (const row of r.rows || []) nameMap[row.DEVICE_ID] = { name: row.DEVICE_NAME, locationId: row.LOCATION_ID };
     } catch (_) {}
     finally { await conn.close().catch(() => {}); }
   }
@@ -1336,9 +1335,9 @@ app.get('/api/alarms/live/:deviceId', authenticate, requirePermission('alarm.rea
     const devR = await conn.execute(
       `SELECT d.device_id, d.device_name, d.device_ip, d.device_port, d.status,
               l.name AS location_name, p.name AS project_name
-         FROM MODBUS_ADMIN.devices d
-         LEFT JOIN MODBUS_ADMIN.locations l ON l.id        = d.location_id
-         LEFT JOIN MODBUS_ADMIN.projects  p ON p.id        = l.project_id
+         FROM devices d
+         LEFT JOIN locations l ON l.id        = d.location_id
+         LEFT JOIN projects  p ON p.id        = l.project_id
         WHERE d.device_id = :deviceId`,
       { deviceId }
     );
@@ -1347,33 +1346,32 @@ app.get('/api/alarms/live/:deviceId', authenticate, requirePermission('alarm.rea
 
     // Last 10 alarm history rows from DB
     const histR = await conn.execute(
-      `SELECT * FROM (
-         SELECT action_id, action_type, action_time
-           FROM MODBUS_ADMIN.device_actions
-          WHERE device_id = :deviceId AND action_type LIKE 'ALARM_%'
-         ORDER BY action_time DESC
-       ) WHERE ROWNUM <= 10`,
+      `SELECT action_id, action_type, action_time
+         FROM device_actions
+        WHERE device_id = :deviceId AND action_type LIKE 'ALARM_%'
+        ORDER BY action_time DESC
+        LIMIT 10`,
       { deviceId }
     );
     const recentHistory = (histR.rows || []).map(row => ({
-      id:       row[0],
-      type:     row[1],
-      time:     row[2],
-      severity: row[1] === 'ALARM_CRITICAL_FUEL'    ? 'critical' : 'warning',
-      message:  row[1] === 'ALARM_CRITICAL_FUEL'    ? 'Fuel critically low'
-               : row[1] === 'ALARM_LOW_FUEL'         ? 'Fuel low'
-               : row[1] === 'ALARM_HIGH_CONSUMPTION' ? 'High consumption rate'
-               : row[1],
+      id:       row.ACTION_ID,
+      type:     row.ACTION_TYPE,
+      time:     row.ACTION_TIME,
+      severity: row.ACTION_TYPE === 'ALARM_CRITICAL_FUEL'    ? 'critical' : 'warning',
+      message:  row.ACTION_TYPE === 'ALARM_CRITICAL_FUEL'    ? 'Fuel critically low'
+               : row.ACTION_TYPE === 'ALARM_LOW_FUEL'         ? 'Fuel low'
+               : row.ACTION_TYPE === 'ALARM_HIGH_CONSUMPTION' ? 'High consumption rate'
+               : row.ACTION_TYPE,
     }));
 
     res.json({
       deviceId,
-      deviceName:   dev[1],
-      ip:           dev[2],
-      port:         dev[3],
-      status:       effectiveStatus(dev[0], dev[4], connectedDeviceIds()),
-      locationName: dev[5] || null,
-      projectName:  dev[6] || null,
+      deviceName:   dev.DEVICE_NAME,
+      ip:           dev.DEVICE_IP,
+      port:         dev.DEVICE_PORT,
+      status:       effectiveStatus(dev.DEVICE_ID, dev.STATUS, connectedDeviceIds()),
+      locationName: dev.LOCATION_NAME || null,
+      projectName:  dev.PROJECT_NAME || null,
       live: {
         active:    isLive,
         checkedAt: snap ? new Date(snap.ts).toISOString() : null,
@@ -1419,8 +1417,8 @@ app.get('/api/projects', authenticate, async (req, res) => {
       const rows = await query(
         `SELECT p.ID, p.NAME, p.DESCRIPTION, p.CREATED_AT, p.UPDATED_AT,
                 p.BRAND_ID, p.METHOD, p.PARENT_ID, b.brand_name AS BRAND_NAME
-           FROM MODBUS_ADMIN.projects p
-           LEFT JOIN MODBUS_ADMIN.brands b ON b.brand_id = p.brand_id
+           FROM projects p
+           LEFT JOIN brands b ON b.brand_id = p.brand_id
           ORDER BY p.ID`);
       return res.json(rows);
     }
@@ -1435,8 +1433,8 @@ app.get('/api/projects', authenticate, async (req, res) => {
     const rows = await query(
       `SELECT p.ID, p.NAME, p.DESCRIPTION, p.CREATED_AT, p.UPDATED_AT,
               p.BRAND_ID, p.METHOD, p.PARENT_ID, b.brand_name AS BRAND_NAME
-         FROM MODBUS_ADMIN.projects p
-         LEFT JOIN MODBUS_ADMIN.brands b ON b.brand_id = p.brand_id
+         FROM projects p
+         LEFT JOIN brands b ON b.brand_id = p.brand_id
         WHERE p.ID IN (${names.join(', ')})
         ORDER BY p.ID`, binds);
     res.json(rows);
@@ -1459,19 +1457,19 @@ app.post('/api/projects', authenticate, requirePermission('project.write'), asyn
   let resolvedMethod = (method === 'cloud' || method === 'ip') ? method : null;
   try {
     if (!resolvedMethod && bId != null) {
-      const brows = await query('SELECT brand_name FROM MODBUS_ADMIN.brands WHERE brand_id = :id', [bId]);
+      const brows = await query('SELECT brand_name FROM brands WHERE brand_id = :id', [bId]);
       const bname = String(brows[0]?.BRAND_NAME ?? brows[0]?.brand_name ?? '');
       // Match both "Datakom" (real name) and the "Datacom" spelling → cloud.
       resolvedMethod = /data[ck]om/i.test(bname) ? 'cloud' : 'ip';
     }
     resolvedMethod = resolvedMethod || 'ip';
     await execute(
-      'INSERT INTO MODBUS_ADMIN.projects (name, description, brand_id, method, parent_id) VALUES (:name, :description, :brand_id, :method, :parent_id)',
+      'INSERT INTO projects (name, description, brand_id, method, parent_id) VALUES (:name, :description, :brand_id, :method, :parent_id)',
       { name: name.trim(), description: description || null, brand_id: bId, method: resolvedMethod, parent_id: parentId }
     );
     res.status(201).json({ success: true });
   } catch (e) {
-    if (e.message.includes('UQ_PROJECTS_NAME')) {
+    if (/uq_projects_name/i.test(e.message)) {
       res.status(409).json({ error: 'Project name must be unique' });
     } else {
       res.status(500).json({ error: e.message });
@@ -1486,8 +1484,8 @@ app.get('/api/projects/:id', authenticate, requirePermission('project.read'), as
     const rows = await query(
       `SELECT p.id, p.name, p.description, p.created_at, p.updated_at,
               p.brand_id, p.method, b.brand_name
-         FROM MODBUS_ADMIN.projects p
-         LEFT JOIN MODBUS_ADMIN.brands b ON b.brand_id = p.brand_id
+         FROM projects p
+         LEFT JOIN brands b ON b.brand_id = p.brand_id
         WHERE p.id = :id`, [id]);
     if (rows.length === 0) return res.status(404).json({ error: 'Project not found' });
     res.json(rows[0]);
@@ -1525,13 +1523,13 @@ app.put('/api/projects/:id', authenticate, requirePermission('project.write'), a
       binds.parent_id = parentId;
     }
     const result = await execute(
-      `UPDATE MODBUS_ADMIN.projects SET ${sets.join(', ')} WHERE id = :id`,
+      `UPDATE projects SET ${sets.join(', ')} WHERE id = :id`,
       binds
     );
     if ((result.rowsAffected || 0) === 0) return res.status(404).json({ error: 'Project not found' });
     res.json({ success: true });
   } catch (e) {
-    if (e.message.includes('UQ_PROJECTS_NAME')) {
+    if (/uq_projects_name/i.test(e.message)) {
       res.status(409).json({ error: 'Project name must be unique' });
     } else {
       res.status(500).json({ error: e.message });
@@ -1552,11 +1550,11 @@ app.delete('/api/projects/:id', authenticate, requirePermission('project.write')
     // If this project is a container, promote its child projects to top-level
     // (parent_id = NULL) rather than orphaning them at a dangling parent.
     await conn.execute(
-      'UPDATE MODBUS_ADMIN.projects SET parent_id = NULL WHERE parent_id = :id',
+      'UPDATE projects SET parent_id = NULL WHERE parent_id = :id',
       { id }
     );
     const result = await conn.execute(
-      'DELETE FROM MODBUS_ADMIN.projects WHERE id = :id',
+      'DELETE FROM projects WHERE id = :id',
       { id }
     );
 
@@ -1585,7 +1583,7 @@ app.get('/api/projects/:projectId/locations', authenticate, async (req, res) => 
     // First get all locations for the project as flat list
     const rows = await query(`
       SELECT id, project_id, parent_id, name, description, address, created_at, updated_at
-      FROM MODBUS_ADMIN.locations 
+      FROM locations
       WHERE project_id = :projectId
       ORDER BY name
     `, [projectId]);
@@ -1691,26 +1689,26 @@ app.post('/api/projects/:projectId/locations', authenticate, requireAnyPermissio
   
   // Validate parent_id belongs to same project if provided
   if (parent_id) {
-    const parent = await query('SELECT project_id FROM MODBUS_ADMIN.locations WHERE id = :id', [parent_id]);
+    const parent = await query('SELECT project_id FROM locations WHERE id = :id', [parent_id]);
     if (parent.length === 0) return res.status(400).json({ error: 'Parent location not found' });
     if (parent[0].PROJECT_ID != projectId) return res.status(400).json({ error: 'Parent must be in same project' });
   }
-  
+
   try {
     if (parent_id) {
       await execute(
-        'INSERT INTO MODBUS_ADMIN.locations (project_id, name, description, address, parent_id) VALUES (:projectId, :name, :description, :address, :parentId)',
+        'INSERT INTO locations (project_id, name, description, address, parent_id) VALUES (:projectId, :name, :description, :address, :parentId)',
         { projectId, name: name.trim(), description: description || null, address: address || null, parentId: parent_id }
       );
     } else {
       await execute(
-        'INSERT INTO MODBUS_ADMIN.locations (project_id, name, description, address) VALUES (:projectId, :name, :description, :address)',
+        'INSERT INTO locations (project_id, name, description, address) VALUES (:projectId, :name, :description, :address)',
         { projectId, name: name.trim(), description: description || null, address: address || null }
       );
     }
     res.status(201).json({ success: true });
   } catch (e) {
-    if (e.message.includes('UQ_LOCATIONS_PROJ_PARENT_NAME')) {
+    if (/uq_locations_proj_parent_name/i.test(e.message)) {
       res.status(409).json({ error: 'Location name must be unique within project/parent' });
     } else {
       res.status(500).json({ error: e.message });
@@ -1723,7 +1721,7 @@ app.get('/api/locations/:id', authenticate, requireAnyPermission(['project.read'
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid location ID' });
   try {
     const rows = await query(
-      'SELECT id, project_id, parent_id, name, description, address, created_at, updated_at FROM MODBUS_ADMIN.locations WHERE id = :id',
+      'SELECT id, project_id, parent_id, name, description, address, created_at, updated_at FROM locations WHERE id = :id',
       [id]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Location not found' });
@@ -1741,11 +1739,11 @@ app.put('/api/locations/:id', authenticate, requireAnyPermission(['project.write
   try {
     // Validate parent_id same project if provided
     if (parent_id !== undefined) {
-      const loc = await query('SELECT project_id FROM MODBUS_ADMIN.locations WHERE id = :id', [id]);
+      const loc = await query('SELECT project_id FROM locations WHERE id = :id', [id]);
       if (loc.length === 0) return res.status(404).json({ error: 'Location not found' });
       const projectId = loc[0].PROJECT_ID;
       if (parent_id) {
-        const parent = await query('SELECT project_id FROM MODBUS_ADMIN.locations WHERE id = :pid', [parent_id]);
+        const parent = await query('SELECT project_id FROM locations WHERE id = :pid', [parent_id]);
         if (parent.length === 0) return res.status(400).json({ error: 'Parent location not found' });
         if (parent[0].PROJECT_ID != projectId) return res.status(400).json({ error: 'Parent must be in same project' });
       }
@@ -1757,13 +1755,13 @@ app.put('/api/locations/:id', authenticate, requireAnyPermission(['project.write
       binds.parentId = parent_id || null;
     }
     const result = await execute(
-      `UPDATE MODBUS_ADMIN.locations SET ${updates.join(', ')} WHERE id = :id`,
+      `UPDATE locations SET ${updates.join(', ')} WHERE id = :id`,
       binds
     );
     if ((result.rowsAffected || 0) === 0) return res.status(404).json({ error: 'Location not found' });
     res.json({ success: true });
   } catch (e) {
-    if (e.message.includes('UQ_LOCATIONS_PROJ_PARENT_NAME')) {
+    if (/uq_locations_proj_parent_name/i.test(e.message)) {
       res.status(409).json({ error: 'Location name must be unique within project/parent' });
     } else {
       res.status(500).json({ error: e.message });
@@ -1776,7 +1774,7 @@ app.delete('/api/locations/:id', authenticate, requireAnyPermission(['project.wr
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid location ID' });
   try {
     const result = await execute(
-      'DELETE FROM MODBUS_ADMIN.locations WHERE id = :id',
+      'DELETE FROM locations WHERE id = :id',
       { id }
     );
     if ((result.rowsAffected || 0) === 0) return res.status(404).json({ error: 'Location not found' });
@@ -1793,8 +1791,8 @@ app.get('/api/locations/:locationId/devices', authenticate, requirePermission('d
   try {
     const rows = await query(
       `SELECT d.device_id as id, d.device_name as name, d.device_ip as ip, d.device_port as port, d.status, d.location_id, d.latitude, d.longitude, d.altitude, d.last_seen, d.brand_id, d.datakom_did, b.brand_name
-         FROM MODBUS_ADMIN.devices d
-         LEFT JOIN MODBUS_ADMIN.brands b ON b.brand_id = d.brand_id
+         FROM devices d
+         LEFT JOIN brands b ON b.brand_id = d.brand_id
         WHERE d.location_id = :locationId ORDER BY d.device_name`,
       [locationId]
     );
@@ -1810,7 +1808,7 @@ app.get('/api/locations/:id/children', authenticate, requireAnyPermission(['proj
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid location ID' });
   try {
     const rows = await query(
-      'SELECT id, project_id, parent_id, name, description, address, created_at, updated_at FROM MODBUS_ADMIN.locations WHERE parent_id = :id ORDER BY name',
+      'SELECT id, project_id, parent_id, name, description, address, created_at, updated_at FROM locations WHERE parent_id = :id ORDER BY name',
       [id]
     );
     res.json(rows);
@@ -1822,7 +1820,7 @@ app.get('/api/locations/:id/children', authenticate, requireAnyPermission(['proj
 // Project tree view
 app.get('/api/project-tree', authenticate, requirePermission('project.read'), async (req, res) => {
   try {
-    const rows = await query('SELECT * FROM MODBUS_ADMIN.v_project_tree');
+    const rows = await query('SELECT * FROM v_project_tree');
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1833,8 +1831,8 @@ app.get('/api/project-tree', authenticate, requirePermission('project.read'), as
 app.get('/api/devices', authenticate, async (req, res) => {
   const { location_id, project_id, status } = req.query;
   let sql = `SELECT d.device_id as id, d.device_name as name, d.device_ip as ip, d.device_port as port, d.status, d.location_id, d.latitude, d.longitude, d.altitude, d.last_seen, d.brand_id, d.datakom_did, b.brand_name
-               FROM MODBUS_ADMIN.devices d
-               LEFT JOIN MODBUS_ADMIN.brands b ON b.brand_id = d.brand_id`;
+               FROM devices d
+               LEFT JOIN brands b ON b.brand_id = d.brand_id`;
   const binds = [];
   const conditions = [];
   if (location_id) {
@@ -1842,7 +1840,7 @@ app.get('/api/devices', authenticate, async (req, res) => {
     binds.push(parseInt(location_id));
   }
   if (project_id) {
-    conditions.push('d.location_id IN (SELECT id FROM MODBUS_ADMIN.locations WHERE project_id = :project_id)');
+    conditions.push('d.location_id IN (SELECT id FROM locations WHERE project_id = :project_id)');
     binds.push(parseInt(project_id));
   }
   if (status) {
@@ -1872,7 +1870,7 @@ app.post('/api/devices', authenticate, requirePermission('device.write'), requir
   try {
     let device_id = parseInt(id);
     if (!device_id || isNaN(device_id)) {
-      const result = await query('SELECT NVL(MAX(device_id), 0) + 1 as next_id FROM MODBUS_ADMIN.DEVICES');
+      const result = await query('SELECT COALESCE(MAX(device_id), 0) + 1 as next_id FROM devices');
       device_id = result[0].NEXT_ID;
     }
     const columns = ['device_id', 'device_name', 'device_ip', 'device_port', 'status'];
@@ -1909,12 +1907,12 @@ app.post('/api/devices', authenticate, requirePermission('device.write'), requir
     }
     if (bindsObj.latitude !== undefined || bindsObj.longitude !== undefined) {
       columns.push('gps_updated_at');
-      bindsObj.gps_updated_at = new Date(); // oracledb binds JS Date to TIMESTAMP
+      bindsObj.gps_updated_at = new Date(); // pg binds a JS Date to TIMESTAMP
     }
     const placeholders = columns.map(c => ':' + c).join(', ');
     const values = columns.map(c => `:${c}`).join(', ');
     await execute(
-      `INSERT INTO MODBUS_ADMIN.DEVICES (${columns.join(', ')}) VALUES (${values})`,
+      `INSERT INTO devices (${columns.join(', ')}) VALUES (${values})`,
       bindsObj
     );
     if (bindsObj.datakom_did != null) refreshDidMap().catch(() => {});
@@ -1942,11 +1940,11 @@ app.put('/api/devices/:deviceId', authenticate, requirePermission('device.write'
     updates.push('device_port = :port'); bindsObj.port = p;
   }
   if (status !== undefined) { updates.push('status = :status'); bindsObj.status = status; }
-  // Optional last_seen: accept an ISO-8601 string, or send now via SYSTIMESTAMP
+  // Optional last_seen: accept an ISO-8601 string, or send now via NOW()
   // when the client passes the literal "now".
   if (last_seen !== undefined) {
     if (last_seen === 'now' || last_seen === null) {
-      updates.push('last_seen = SYSTIMESTAMP');
+      updates.push('last_seen = NOW()');
     } else {
       const d = new Date(last_seen);
       if (Number.isNaN(d.getTime())) return res.status(400).json({ error: 'Invalid last_seen' });
@@ -1997,7 +1995,7 @@ app.put('/api/devices/:deviceId', authenticate, requirePermission('device.write'
   const setClause = updates.join(', ');
   try {
     const result = await execute(
-      `UPDATE MODBUS_ADMIN.DEVICES SET ${setClause} WHERE device_id = :id`,
+      `UPDATE devices SET ${setClause} WHERE device_id = :id`,
       bindsObj
     );
     if ((result.rowsAffected || 0) === 0) {
@@ -2020,7 +2018,7 @@ app.patch('/api/devices/:deviceId/last-seen', authenticate, requirePermission('d
   }
   try {
     const result = await execute(
-      `UPDATE MODBUS_ADMIN.devices SET last_seen = SYSTIMESTAMP WHERE device_id = :id`,
+      `UPDATE devices SET last_seen = NOW() WHERE device_id = :id`,
       { id: deviceId }
     );
     if ((result.rowsAffected || 0) === 0) {
@@ -2047,8 +2045,8 @@ app.get('/api/brands', authenticate, requirePermission('device.read'), async (_,
   try {
     const rows = await query(
       `SELECT b.brand_id AS id, b.brand_name AS name, b.created_at,
-              (SELECT COUNT(*) FROM MODBUS_ADMIN.devices d WHERE d.brand_id = b.brand_id) AS device_count
-         FROM MODBUS_ADMIN.brands b
+              (SELECT COUNT(*) FROM devices d WHERE d.brand_id = b.brand_id) AS device_count
+         FROM brands b
         ORDER BY b.brand_name`
     );
     res.json(rows);
@@ -2063,11 +2061,11 @@ app.post('/api/brands', authenticate, requirePermission('device.write'), async (
   if (!name) return res.status(400).json({ error: 'Name required' });
   try {
     const result = await execute(
-      `INSERT INTO MODBUS_ADMIN.brands (brand_name) VALUES (:name)
-         RETURNING brand_id INTO :id`,
-      { name, id: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER } }
+      `INSERT INTO brands (brand_name) VALUES (:name)
+         RETURNING brand_id`,
+      { name }
     );
-    res.status(201).json({ success: true, id: result.outBinds?.id?.[0] ?? null, name });
+    res.status(201).json({ success: true, id: result.rows?.[0]?.BRAND_ID ?? null, name });
   } catch (e) {
     if (/uq_brands_name|unique constraint/i.test(e.message)) {
       return res.status(409).json({ error: 'Brand name must be unique' });
@@ -2084,7 +2082,7 @@ app.put('/api/brands/:id', authenticate, requirePermission('device.write'), asyn
   if (!name) return res.status(400).json({ error: 'Name required' });
   try {
     const result = await execute(
-      `UPDATE MODBUS_ADMIN.brands SET brand_name = :name WHERE brand_id = :id`,
+      `UPDATE brands SET brand_name = :name WHERE brand_id = :id`,
       { name, id }
     );
     if ((result.rowsAffected || 0) === 0) return res.status(404).json({ error: 'Brand not found' });
@@ -2104,7 +2102,7 @@ app.delete('/api/brands/:id', authenticate, requirePermission('device.write'), a
   try {
     // FK is ON DELETE SET NULL, so any devices using this brand keep existing
     // with brand_id cleared.
-    const result = await execute(`DELETE FROM MODBUS_ADMIN.brands WHERE brand_id = :id`, { id });
+    const result = await execute(`DELETE FROM brands WHERE brand_id = :id`, { id });
     if ((result.rowsAffected || 0) === 0) return res.status(404).json({ error: 'Brand not found' });
     res.json({ success: true, deleted: id });
   } catch (e) {
@@ -2371,16 +2369,16 @@ app.get('/api/device-settings/:deviceId', authenticate, requirePermission('setti
 
   try {
     const result = await conn.execute(
-      'SELECT setting_key, setting_value, setting_type FROM MODBUS_ADMIN.device_settings WHERE device_id = :deviceId',
+      'SELECT setting_key, setting_value, setting_type FROM device_settings WHERE device_id = :deviceId',
       { deviceId }
     );
 
     // Convert rows to key-value object
     const settings = {};
     for (const row of result.rows) {
-      const key = row[0];
-      const value = row[1];
-      const type = row[2];
+      const key = row.SETTING_KEY;
+      const value = row.SETTING_VALUE;
+      const type = row.SETTING_TYPE;
       
       if (type === 'number') {
         settings[key] = parseFloat(value);
@@ -2421,7 +2419,7 @@ app.put('/api/device-settings/:deviceId', authenticate, requirePermission('setti
   try {
     // Check if device exists
     const deviceCheck = await conn.execute(
-      'SELECT device_id FROM MODBUS_ADMIN.devices WHERE device_id = :deviceId',
+      'SELECT device_id FROM devices WHERE device_id = :deviceId',
       { deviceId }
     );
 
@@ -2436,8 +2434,8 @@ app.put('/api/device-settings/:deviceId', authenticate, requirePermission('setti
       
       // Try update first, then insert if not found
       const updateResult = await conn.execute(
-        `UPDATE MODBUS_ADMIN.device_settings 
-         SET setting_value = :value, setting_type = :type, updated_at = SYSTIMESTAMP 
+        `UPDATE device_settings
+         SET setting_value = :value, setting_type = :type, updated_at = NOW()
          WHERE device_id = :deviceId AND setting_key = :key`,
         { value: stringValue, type, deviceId, key }
       );
@@ -2445,7 +2443,7 @@ app.put('/api/device-settings/:deviceId', authenticate, requirePermission('setti
       if (updateResult.rowsAffected === 0) {
         // Insert new setting
         await conn.execute(
-          `INSERT INTO MODBUS_ADMIN.device_settings (device_id, setting_key, setting_value, setting_type) 
+          `INSERT INTO device_settings (device_id, setting_key, setting_value, setting_type)
            VALUES (:deviceId, :key, :value, :type)`,
           { deviceId, key, value: stringValue, type }
         );
@@ -2510,13 +2508,13 @@ app.get('/api/settings', authenticate, requirePermission('settings.read'), async
 
   try {
     const result = await conn.execute(
-      'SELECT setting_key, setting_value, setting_type FROM MODBUS_ADMIN.system_settings'
+      'SELECT setting_key, setting_value, setting_type FROM system_settings'
     );
 
     // Build DB map
     const dbMap = {};
     for (const row of result.rows) {
-      dbMap[row[0]] = { value: row[1], type: row[2] };
+      dbMap[row.SETTING_KEY] = { value: row.SETTING_VALUE, type: row.SETTING_TYPE };
     }
 
     // Merge: start with defaults, overlay DB values
@@ -2549,7 +2547,7 @@ app.get('/api/settings', authenticate, requirePermission('settings.read'), async
           for (const key of toInsert) {
             const def = SETTING_DEFAULTS[key];
             await insertConn.execute(
-              `INSERT INTO MODBUS_ADMIN.system_settings (setting_key, setting_value, setting_type)
+              `INSERT INTO system_settings (setting_key, setting_value, setting_type)
                VALUES (:key, :value, :type)`,
               { key, value: def.value, type: def.type }
             );
@@ -2597,15 +2595,15 @@ app.put('/api/settings', authenticate, requirePermission('settings.write'), asyn
         ?? (typeof value === 'number' ? 'number' : typeof value === 'boolean' ? 'boolean' : 'string');
 
       const updateResult = await conn.execute(
-        `UPDATE MODBUS_ADMIN.system_settings 
-         SET setting_value = :value, setting_type = :type, updated_at = SYSTIMESTAMP 
+        `UPDATE system_settings
+         SET setting_value = :value, setting_type = :type, updated_at = NOW()
          WHERE setting_key = :key`,
         { value: stringValue, type, key }
       );
 
       if ((updateResult.rowsAffected || 0) === 0) {
         await conn.execute(
-          `INSERT INTO MODBUS_ADMIN.system_settings (setting_key, setting_value, setting_type) 
+          `INSERT INTO system_settings (setting_key, setting_value, setting_type)
            VALUES (:key, :value, :type)`,
           { key, value: stringValue, type }
         );
@@ -2663,79 +2661,35 @@ app.put('/api/page-content', authenticate, requirePermission('settings.write'), 
 
 
 // ── Startup ───────────────────────────────────────────────────────────────
-// Auto-creates the alarm_acknowledgments table and its sequence if they don't
-// exist yet (safe to call on every startup — uses WHEN OTHERS THEN IF ... END).
-// Also ensures ACTION_TYPE column is wide enough for all alarm type strings.
+// Auto-creates the alarm_acknowledgments table and the handful of columns it
+// and the projects/devices tables depend on, if they don't exist yet — safe to
+// call on every startup. On a DB created from migrations/postgres/001_init.sql
+// these are all already present, so every statement here is a no-op.
 async function ensureAckTable() {
   const conn = await getConnection();
   if (!conn) return;
   try {
-    // Widen ACTION_TYPE so ALARM_HIGH_CONSUMPTION (22 chars) fits.
-    // MODIFY is a no-op if the column is already wide enough.
-    try {
-      await conn.execute(
-        `ALTER TABLE MODBUS_ADMIN.device_actions MODIFY (ACTION_TYPE VARCHAR2(50))`
-      );
-      console.log('[DB] device_actions.ACTION_TYPE widened to VARCHAR2(50)');
-    } catch (e) {
-      // ORA-01442 = column is already that size or wider — safe to ignore
-      if (!/ORA-01442|ORA-01451/i.test(e.message)) {
-        console.warn('[DB] Could not widen ACTION_TYPE:', e.message);
-      }
-    }
+    await conn.execute(`ALTER TABLE device_actions ALTER COLUMN action_type TYPE VARCHAR(50)`);
     // Link column: which Datakom Rainbow device (did) a device maps to. Nullable;
-    // only set for brand=Datakom devices. ORA-01430 = column already exists.
-    try {
-      await conn.execute(`ALTER TABLE MODBUS_ADMIN.devices ADD (DATAKOM_DID NUMBER)`);
-      console.log('[DB] devices.DATAKOM_DID column added');
-    } catch (e) {
-      if (!/ORA-01430/i.test(e.message)) console.warn('[DB] Could not add DATAKOM_DID:', e.message);
-    }
-    // Project connection profile: BRAND_ID (which brand the project is for) and
-    // METHOD ('cloud' = Datakom Rainbow, 'ip' = Modbus TCP). Added idempotently so
-    // existing DBs upgrade on the next startup — this is what makes the projects
-    // API (GET /api/projects joins p.brand_id) work. Each column is added on its
-    // own so a partially-migrated DB still fills the gap. ORA-01430 = already exists.
-    for (const col of ['BRAND_ID NUMBER', `METHOD VARCHAR2(10) DEFAULT 'ip'`]) {
-      try {
-        await conn.execute(`ALTER TABLE MODBUS_ADMIN.projects ADD (${col})`);
-        console.log(`[DB] projects column added: ${col}`);
-      } catch (e) {
-        if (!/ORA-01430/i.test(e.message)) console.warn(`[DB] Could not add projects.${col}:`, e.message);
-      }
-    }
-    // Sequence for ack_id
+    // only set for brand=Datakom devices.
+    await conn.execute(`ALTER TABLE devices ADD COLUMN IF NOT EXISTS datakom_did INTEGER`);
+    // Project connection profile: brand_id (which brand the project is for) and
+    // method ('cloud' = Datakom Rainbow, 'ip' = Modbus TCP) — this is what makes
+    // the projects API (GET /api/projects joins p.brand_id) work.
+    await conn.execute(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS brand_id INTEGER`);
+    await conn.execute(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS method VARCHAR(10) DEFAULT 'ip'`);
     await conn.execute(`
-      BEGIN
-        EXECUTE IMMEDIATE 'CREATE SEQUENCE MODBUS_ADMIN.alarm_ack_seq START WITH 1 INCREMENT BY 1 NOCACHE';
-      EXCEPTION
-        WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF;
-      END;
+      CREATE TABLE IF NOT EXISTS alarm_acknowledgments (
+        ack_id          INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+        action_id       INTEGER NOT NULL,
+        device_id       INTEGER NOT NULL,
+        acknowledged_by INTEGER,
+        acknowledged_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        CONSTRAINT fk_ack_device FOREIGN KEY (device_id)
+          REFERENCES devices(device_id) ON DELETE CASCADE
+      )
     `);
-    // Table
-    await conn.execute(`
-      BEGIN
-        EXECUTE IMMEDIATE 'CREATE TABLE MODBUS_ADMIN.alarm_acknowledgments (
-          ack_id          NUMBER PRIMARY KEY,
-          action_id       NUMBER NOT NULL,
-          device_id       NUMBER NOT NULL,
-          acknowledged_by NUMBER,
-          acknowledged_at TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
-          CONSTRAINT fk_ack_device FOREIGN KEY (device_id)
-            REFERENCES MODBUS_ADMIN.devices(device_id) ON DELETE CASCADE
-        )';
-      EXCEPTION
-        WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF;
-      END;
-    `);
-    // Index for fast lookups on action_id
-    await conn.execute(`
-      BEGIN
-        EXECUTE IMMEDIATE 'CREATE INDEX MODBUS_ADMIN.ix_ack_action ON MODBUS_ADMIN.alarm_acknowledgments(action_id)';
-      EXCEPTION
-        WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF;
-      END;
-    `);
+    await conn.execute(`CREATE INDEX IF NOT EXISTS ix_ack_action ON alarm_acknowledgments(action_id)`);
     console.log('[DB] alarm_acknowledgments table ready');
   } catch (e) {
     console.warn('[DB] ensureAckTable warning:', e.message);

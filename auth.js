@@ -7,7 +7,7 @@
  * Token strategy:
  *   - Access token : short-lived JWT (15 min), sent in `Authorization: Bearer …`.
  *   - Refresh token: long-lived opaque random string (7 days). The server
- *     stores only sha256(refresh) in MODBUS_ADMIN.user_sessions so a DB leak
+ *     stores only sha256(refresh) in user_sessions so a DB leak
  *     can't grant access. Logout = delete the row. Force-logout-all = delete
  *     all rows for that user_id.
  */
@@ -15,7 +15,6 @@
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const jwt    = require('jsonwebtoken');
-const oracledb = require('oracledb');
 const { getConnection } = require('./db');
 const { keysSatisfying } = require('./rbac-defaults');
 
@@ -77,8 +76,8 @@ function _hashRefreshToken(token) {
 async function issueSession(userId, { userAgent, ip } = {}) {
   const raw  = _generateRefreshToken();
   const hash = _hashRefreshToken(raw);
-  // Compute the expiry server-side (SYSTIMESTAMP + interval) instead of
-  // binding a JS Date — avoids any oracledb TIMESTAMP-bind quirks.
+  // Compute the expiry server-side (NOW() + interval) instead of
+  // binding a JS Date — avoids driver TIMESTAMP-bind quirks.
   const ttlSeconds = Math.floor(REFRESH_TOKEN_TTL_MS / 1000);
   const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_MS);
 
@@ -86,10 +85,10 @@ async function issueSession(userId, { userAgent, ip } = {}) {
   if (!conn) throw new Error('DB unavailable');
   try {
     await conn.execute(
-      `INSERT INTO MODBUS_ADMIN.user_sessions
+      `INSERT INTO user_sessions
           (user_id, refresh_token_hash, user_agent, ip_address, expires_at)
        VALUES (:userId, :hash, :ua, :ip,
-               SYSTIMESTAMP + NUMTODSINTERVAL(:ttl, 'SECOND'))`,
+               NOW() + (:ttl * INTERVAL '1 second'))`,
       {
         userId,
         hash,
@@ -120,11 +119,10 @@ async function consumeRefreshToken(rawToken) {
     const r = await conn.execute(
       `SELECT s.session_id, s.user_id, s.expires_at, s.revoked_at,
               u.username, u.status
-         FROM MODBUS_ADMIN.user_sessions s
-         JOIN MODBUS_ADMIN.users         u ON u.user_id = s.user_id
+         FROM user_sessions s
+         JOIN users         u ON u.user_id = s.user_id
         WHERE s.refresh_token_hash = :hash`,
-      { hash },
-      { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      { hash }
     );
     const row = (r.rows || [])[0];
     if (!row) return null;
@@ -134,8 +132,8 @@ async function consumeRefreshToken(rawToken) {
 
     // Bump last_used_at (best-effort; don't block on errors)
     conn.execute(
-      `UPDATE MODBUS_ADMIN.user_sessions
-          SET last_used_at = SYSTIMESTAMP
+      `UPDATE user_sessions
+          SET last_used_at = NOW()
         WHERE session_id = :sid`,
       { sid: row.SESSION_ID },
       { autoCommit: true }
@@ -162,7 +160,7 @@ async function revokeSessionByToken(rawToken) {
   if (!conn) return false;
   try {
     const r = await conn.execute(
-      `DELETE FROM MODBUS_ADMIN.user_sessions WHERE refresh_token_hash = :hash`,
+      `DELETE FROM user_sessions WHERE refresh_token_hash = :hash`,
       { hash },
       { autoCommit: true }
     );
@@ -178,7 +176,7 @@ async function revokeAllSessions(userId) {
   if (!conn) return false;
   try {
     await conn.execute(
-      `DELETE FROM MODBUS_ADMIN.user_sessions WHERE user_id = :userId`,
+      `DELETE FROM user_sessions WHERE user_id = :userId`,
       { userId },
       { autoCommit: true }
     );
@@ -201,11 +199,10 @@ async function findUserByLogin(login) {
     const r = await conn.execute(
       `SELECT user_id, username, email, password_hash, full_name, status,
               failed_logins, locked_until
-         FROM MODBUS_ADMIN.users
+         FROM users
         WHERE LOWER(username) = LOWER(:login)
            OR LOWER(email)    = LOWER(:login)`,
-      { login },
-      { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      { login }
     );
     return (r.rows || [])[0] || null;
   } finally {
@@ -219,10 +216,9 @@ async function findUserById(userId) {
   try {
     const r = await conn.execute(
       `SELECT user_id, username, email, full_name, status, last_login_at, created_at
-         FROM MODBUS_ADMIN.users
+         FROM users
         WHERE user_id = :userId`,
-      { userId },
-      { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      { userId }
     );
     return (r.rows || [])[0] || null;
   } finally {
@@ -236,17 +232,17 @@ async function recordFailedLogin(userId) {
   if (!conn) return;
   try {
     await conn.execute(
-      `UPDATE MODBUS_ADMIN.users
+      `UPDATE users
           SET failed_logins = failed_logins + 1,
               locked_until = CASE
                 WHEN failed_logins + 1 >= :maxFails
-                THEN SYSTIMESTAMP + NUMTODSINTERVAL(:lockMin, 'MINUTE')
+                THEN NOW() + (:lockMin * INTERVAL '1 minute')
                 ELSE locked_until
               END,
               status = CASE
                 WHEN failed_logins + 1 >= :maxFails THEN 'locked' ELSE status
               END,
-              updated_at = SYSTIMESTAMP
+              updated_at = NOW()
         WHERE user_id = :userId`,
       { userId, maxFails: MAX_FAILED_LOGINS, lockMin: LOCK_DURATION_MIN },
       { autoCommit: true }
@@ -262,12 +258,12 @@ async function recordSuccessfulLogin(userId) {
   if (!conn) return;
   try {
     await conn.execute(
-      `UPDATE MODBUS_ADMIN.users
+      `UPDATE users
           SET failed_logins = 0,
               locked_until  = NULL,
               status        = CASE WHEN status = 'locked' THEN 'active' ELSE status END,
-              last_login_at = SYSTIMESTAMP,
-              updated_at    = SYSTIMESTAMP
+              last_login_at = NOW(),
+              updated_at    = NOW()
         WHERE user_id = :userId`,
       { userId },
       { autoCommit: true }
@@ -289,7 +285,7 @@ async function isAccountLocked(user) {
     if (conn) {
       try {
         await conn.execute(
-          `UPDATE MODBUS_ADMIN.users
+          `UPDATE users
               SET status = 'active', failed_logins = 0, locked_until = NULL
             WHERE user_id = :userId`,
           { userId: user.USER_ID },
@@ -310,7 +306,7 @@ async function logAudit({ userId, usernameTry, eventType, ip, userAgent, detail 
   if (!conn) return;
   try {
     await conn.execute(
-      `INSERT INTO MODBUS_ADMIN.user_login_audit
+      `INSERT INTO user_login_audit
          (user_id, username_try, event_type, ip_address, user_agent, detail)
        VALUES (:userId, :uname, :etype, :ipAddr, :ua, :detail)`,
       {
@@ -383,11 +379,10 @@ async function _resolveScopeChain({ projectId, locationId, deviceId }) {
     if (deviceId) {
       const r = await conn.execute(
         `SELECT d.location_id, l.project_id
-           FROM MODBUS_ADMIN.devices d
-           LEFT JOIN MODBUS_ADMIN.locations l ON l.id = d.location_id
+           FROM devices d
+           LEFT JOIN locations l ON l.id = d.location_id
           WHERE d.device_id = :deviceId`,
-        { deviceId },
-        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        { deviceId }
       );
       const row = (r.rows || [])[0];
       if (row) {
@@ -396,9 +391,8 @@ async function _resolveScopeChain({ projectId, locationId, deviceId }) {
       }
     } else if (locationId) {
       const r = await conn.execute(
-        `SELECT project_id FROM MODBUS_ADMIN.locations WHERE id = :locationId`,
-        { locationId },
-        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        `SELECT project_id FROM locations WHERE id = :locationId`,
+        { locationId }
       );
       const row = (r.rows || [])[0];
       if (row) projectId = projectId ?? row.PROJECT_ID ?? null;
@@ -474,14 +468,14 @@ async function userHasAnyPermission(userId, permissionKeys, scope = null) {
 
     const r = await conn.execute(
       `SELECT 1
-         FROM MODBUS_ADMIN.user_roles       ur
-         JOIN MODBUS_ADMIN.role_permissions rp ON rp.role_id      = ur.role_id
-         JOIN MODBUS_ADMIN.permissions      p  ON p.permission_id = rp.permission_id
-         JOIN MODBUS_ADMIN.users            u  ON u.user_id       = ur.user_id
+         FROM user_roles       ur
+         JOIN role_permissions rp ON rp.role_id      = ur.role_id
+         JOIN permissions      p  ON p.permission_id = rp.permission_id
+         JOIN users            u  ON u.user_id       = ur.user_id
         WHERE u.status          = 'active'
           AND ur.user_id        = :userId
           AND p.permission_key IN (${placeholders.join(', ')})${scopeSql}
-          AND ROWNUM = 1`,
+        LIMIT 1`,
       binds
     );
     const ok = (r.rows || []).length > 0;
@@ -514,20 +508,18 @@ async function getUserRolesAndPermissions(userId) {
     const [rolesRes, permsRes] = await Promise.all([
       conn.execute(
         `SELECT r.role_key, r.role_name, ur.project_id, ur.location_id, ur.device_id
-           FROM MODBUS_ADMIN.user_roles ur
-           JOIN MODBUS_ADMIN.roles      r ON r.role_id = ur.role_id
+           FROM user_roles ur
+           JOIN roles      r ON r.role_id = ur.role_id
           WHERE ur.user_id = :userId`,
-        { userId },
-        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        { userId }
       ),
       conn.execute(
         `SELECT DISTINCT p.permission_key, ur.project_id, ur.location_id, ur.device_id
-           FROM MODBUS_ADMIN.user_roles       ur
-           JOIN MODBUS_ADMIN.role_permissions rp ON rp.role_id      = ur.role_id
-           JOIN MODBUS_ADMIN.permissions      p  ON p.permission_id = rp.permission_id
+           FROM user_roles       ur
+           JOIN role_permissions rp ON rp.role_id      = ur.role_id
+           JOIN permissions      p  ON p.permission_id = rp.permission_id
           WHERE ur.user_id = :userId`,
-        { userId },
-        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        { userId }
       ),
     ]);
     return {

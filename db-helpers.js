@@ -1,11 +1,10 @@
-const oracledb = require('oracledb');
 const { getConnection } = require('./db');
 
 async function query(sql, binds = [], options = {}) {
   const connection = await getConnection();
   if (!connection) return [];
   try {
-    const result = await connection.execute(sql, binds, { ...options, outFormat: oracledb.OUT_FORMAT_OBJECT });
+    const result = await connection.execute(sql, binds, options);
     return result.rows || [];
   } catch (err) {
     console.error(`Query failed: ${err.message}`);
@@ -32,4 +31,3 @@ async function execute(sql, binds = [], options = { autoCommit: true }) {
 }
 
 module.exports = { query, execute };
-

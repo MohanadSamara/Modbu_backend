@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "node --test"
+    "test": "node --test",
+    "build:frontend": "node scripts/build-frontend.js",
+    "migrate:postgres": "node scripts/migrate-oracle-to-postgres.js"
   },
   "keywords": [],
   "author": "",
@@ -21,7 +23,10 @@
     "jsonwebtoken": "^9.0.3",
     "modbus-serial": "^8.0.25",
     "nodemon": "^3.1.14",
-    "oracledb": "^6.10.0",
+    "pg": "^8.22.0",
     "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "oracledb": "^7.0.1"
   }
 }

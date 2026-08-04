@@ -22,8 +22,8 @@ const { query } = require('./db-helpers');
 async function getUserScope(userId) {
   const rows = await query(
     `SELECT ur.project_id AS PID, ur.location_id AS LID, ur.device_id AS DID
-       FROM MODBUS_ADMIN.user_roles ur
-       JOIN MODBUS_ADMIN.users u ON u.user_id = ur.user_id
+       FROM user_roles ur
+       JOIN users u ON u.user_id = ur.user_id
       WHERE u.status = 'active' AND ur.user_id = :userId`,
     { userId }
   );
@@ -54,7 +54,7 @@ async function projectsOfLocations(locSet) {
   if (!locSet.size) return new Set();
   const { clause, binds } = inClause('l', locSet);
   const rows = await query(
-    `SELECT DISTINCT project_id AS P FROM MODBUS_ADMIN.locations WHERE id IN (${clause})`, binds);
+    `SELECT DISTINCT project_id AS P FROM locations WHERE id IN (${clause})`, binds);
   return new Set(rows.map(r => (r.P != null ? Number(r.P) : null)).filter(Boolean));
 }
 
@@ -64,8 +64,8 @@ async function locationsOfDevices(devSet) {
   const { clause, binds } = inClause('d', devSet);
   const rows = await query(
     `SELECT d.device_id AS DID, d.location_id AS LID, l.project_id AS P
-       FROM MODBUS_ADMIN.devices d
-       LEFT JOIN MODBUS_ADMIN.locations l ON l.id = d.location_id
+       FROM devices d
+       LEFT JOIN locations l ON l.id = d.location_id
       WHERE d.device_id IN (${clause})`, binds);
   return rows.map(r => ({
     deviceId:   Number(r.DID),
@@ -145,7 +145,7 @@ async function filterVisibleDevices(userId, rows) {
       guard.add(cur);
       ancestors.add(cur);
       const r = await query(
-        `SELECT project_id AS P, parent_id AS PID FROM MODBUS_ADMIN.locations WHERE id = :id`,
+        `SELECT project_id AS P, parent_id AS PID FROM locations WHERE id = :id`,
         { id: cur });
       if (!r.length) break;
       projectId = r[0].P != null ? Number(r[0].P) : projectId;

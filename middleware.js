@@ -180,7 +180,7 @@ async function _loadEndpoints() {
     return _endpointCache.rows;
   }
   const rows = await query(
-    `SELECT permission_key, http_method, path_pattern FROM MODBUS_ADMIN.permission_endpoints`
+    `SELECT permission_key, http_method, path_pattern FROM permission_endpoints`
   );
   const parsed = (rows || []).map((r) => ({
     key: r.PERMISSION_KEY,

@@ -15,7 +15,6 @@
  */
 
 const express = require('express');
-const oracledb = require('oracledb');
 const router = express.Router();
 
 const {
@@ -217,9 +216,8 @@ router.post('/change-password', authenticate, async (req, res) => {
   if (!conn) return res.status(503).json({ error: 'DB unavailable' });
   try {
     const r = await conn.execute(
-      `SELECT password_hash FROM MODBUS_ADMIN.users WHERE user_id = :userId`,
-      { userId: req.user.id },
-      { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      `SELECT password_hash FROM users WHERE user_id = :userId`,
+      { userId: req.user.id }
     );
     const row = (r.rows || [])[0];
     if (!row) return res.status(404).json({ error: 'User not found' });
@@ -229,10 +227,10 @@ router.post('/change-password', authenticate, async (req, res) => {
 
     const newHash = await hashPassword(newPassword);
     await conn.execute(
-      `UPDATE MODBUS_ADMIN.users
+      `UPDATE users
           SET password_hash = :newHash,
-              password_changed_at = SYSTIMESTAMP,
-              updated_at = SYSTIMESTAMP
+              password_changed_at = NOW(),
+              updated_at = NOW()
         WHERE user_id = :userId`,
       { newHash, userId: req.user.id },
       { autoCommit: true }
