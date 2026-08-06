@@ -32,6 +32,7 @@ const { hashPassword, invalidateUserPermsCache, revokeAllSessions } = require('.
 const { authenticate, requirePermission, invalidateEndpointCache } = require('./middleware');
 const { getConnection, restoreDefaultPermissions, restoreDefaultRolePermissions, ensureUiElementCatalog } = require('./db');
 const { query, execute } = require('./db-helpers');
+const rbac = require('./rbac-defaults');
 
 // Postgres reports "relation does not exist" as error code 42P01 — used below
 // wherever a table might not have been created yet on an older DB.
@@ -468,17 +469,10 @@ router.post('/roles/reset', requirePermission('user.assign_role'), async (_req, 
 
 // Built-in permission keys — referenced directly in backend route guards and
 // frontend gates. They can be re-described but NOT renamed or deleted from the
-// UI, since removing them would silently break access checks.
-const BUILTIN_PERMISSION_KEYS = new Set([
-  'device.read', 'device.write', 'device.connect', 'device.control',
-  'device.start', 'device.stop',
-  'fuel.read', 'alarm.read',
-  'project.read', 'project.write',
-  'location.read', 'location.write',
-  'settings.read', 'settings.write',
-  'user.read', 'user.write', 'user.assign_role',
-  'audit.read',
-]);
+// UI, since removing them would silently break access checks. Sourced from
+// rbac-defaults.js (single source of truth) instead of a separate hardcoded
+// list, so newly added built-ins don't silently show up as "custom" here.
+const BUILTIN_PERMISSION_KEYS = new Set(rbac.BUILTIN_PERMISSION_KEYS);
 
 // ── GET /api/permissions ──────────────────────────────────────────────────
 router.get('/permissions', requirePermission('user.read'), async (_req, res) => {

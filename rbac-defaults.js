@@ -34,6 +34,18 @@ const BUILTIN_PERMISSIONS = [
   { key: 'audit.read',       description: 'View audit log',             resource: 'audit',    level: 'read' },
   { key: 'datakom.read',     description: 'View live Datakom Rainbow data', resource: 'datakom', level: 'read' },
   { key: 'datakom.write',    description: 'Link / unlink Datakom devices',  resource: 'datakom', level: 'write' },
+
+  // Dashboard (home page) — one permission per card/section, so an admin can
+  // show or hide individual dashboard cards per role from the Permissions page,
+  // the same way every other resource is controlled.
+  { key: 'dashboard.health',       description: 'View the dashboard Health card',              resource: 'dashboard', level: 'read' },
+  { key: 'dashboard.alarms',       description: 'View the dashboard Alarms card',               resource: 'dashboard', level: 'read' },
+  { key: 'dashboard.run_history',  description: 'View the dashboard Run History card',          resource: 'dashboard', level: 'read' },
+  { key: 'dashboard.fuel',         description: 'View the dashboard Fuel Levels card',          resource: 'dashboard', level: 'read' },
+  { key: 'dashboard.device_map',   description: 'View the dashboard Device Map card',           resource: 'dashboard', level: 'read' },
+  { key: 'dashboard.scada_promo',  description: 'View the "Create Your Dashboard" promo card',  resource: 'dashboard', level: 'read' },
+  { key: 'dashboard.stat_cards',   description: 'View the dashboard stat cards row',            resource: 'dashboard', level: 'read' },
+  { key: 'dashboard.quick_access', description: 'View the dashboard Quick Access section',      resource: 'dashboard', level: 'read' },
 ];
 
 // ── Built-in system roles + the permission keys each one holds ───────────────
@@ -54,6 +66,8 @@ const SYSTEM_ROLES = [
     permissions: [
       'device.read', 'device.connect', 'device.control', 'device.start', 'device.stop',
       'fuel.read', 'alarm.read', 'project.read', 'location.read', 'settings.read',
+      'dashboard.health', 'dashboard.alarms', 'dashboard.run_history', 'dashboard.fuel',
+      'dashboard.device_map', 'dashboard.scada_promo', 'dashboard.stat_cards', 'dashboard.quick_access',
     ],
   },
 ];
