@@ -631,7 +631,7 @@ async function getEffectiveThresholds(deviceId) {
         `SELECT setting_key, setting_value
            FROM device_settings
           WHERE device_id = :deviceId
-            AND setting_key IN ('LOW_TANK_THRESHOLD','CRITICAL_TANK_THRESHOLD','CONSUMPTION_RATE_THRESHOLD','FUEL_ALERTS_ENABLED')`,
+            AND setting_key IN ('LOW_TANK_THRESHOLD','CRITICAL_TANK_THRESHOLD','CONSUMPTION_RATE_THRESHOLD','FUEL_ALERTS_ENABLED','ALARM_COOLDOWN_MINUTES')`,
         { deviceId }
       );
       for (const row of devRes.rows || []) {
@@ -2553,6 +2553,33 @@ app.put('/api/device-settings/:deviceId', authenticate, requirePermission('setti
   } catch (e) {
     try { await conn.rollback(); } catch (_) {}
     console.error('PUT /api/device-settings error:', e.message);
+    res.status(500).json({ error: e.message });
+  } finally {
+    try { await conn.close(); } catch (_) {}
+  }
+});
+
+// DELETE — clear every per-device override, falling back to the general
+// (system) settings for this device.
+app.delete('/api/device-settings/:deviceId', authenticate, requirePermission('settings.write'), async (req, res) => {
+  const deviceId = parseInt(req.params.deviceId);
+  if (!Number.isInteger(deviceId) || deviceId <= 0) {
+    return res.status(400).json({ error: 'Invalid device ID' });
+  }
+
+  const conn = await getConnection();
+  if (!conn) {
+    return res.status(503).json({ error: 'DB unavailable' });
+  }
+
+  try {
+    await conn.execute('DELETE FROM device_settings WHERE device_id = :deviceId', { deviceId });
+    await conn.commit();
+    invalidateThresholdsCache(deviceId);
+    res.json({ success: true, deviceId });
+  } catch (e) {
+    try { await conn.rollback(); } catch (_) {}
+    console.error('DELETE /api/device-settings error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { await conn.close(); } catch (_) {}
