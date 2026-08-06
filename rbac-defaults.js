@@ -36,6 +36,8 @@ const BUILTIN_PERMISSIONS = [
   { key: 'datakom.write',    description: 'Link / unlink Datakom devices',  resource: 'datakom', level: 'write' },
   { key: 'brand.read',       description: 'View device brands',            resource: 'brand',   level: 'read' },
   { key: 'brand.write',      description: 'Create/edit/delete brands',     resource: 'brand',   level: 'write' },
+  { key: 'tank.read',        description: 'View a device\'s tank & alarm settings',    resource: 'tank', level: 'read' },
+  { key: 'tank.write',       description: 'Edit a device\'s tank & alarm settings',    resource: 'tank', level: 'write' },
 
   // Dashboard (home page) — one permission per card/section, so an admin can
   // show or hide individual dashboard cards per role from the Permissions page,
@@ -68,7 +70,7 @@ const SYSTEM_ROLES = [
     permissions: [
       'device.read', 'device.connect', 'device.control', 'device.start', 'device.stop',
       'fuel.read', 'alarm.read', 'project.read', 'location.read', 'settings.read',
-      'datakom.read', 'brand.read',
+      'datakom.read', 'brand.read', 'tank.read',
       'dashboard.health', 'dashboard.alarms', 'dashboard.run_history', 'dashboard.fuel',
       'dashboard.device_map', 'dashboard.scada_promo', 'dashboard.stat_cards', 'dashboard.quick_access',
     ],

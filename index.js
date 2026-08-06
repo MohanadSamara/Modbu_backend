@@ -2453,7 +2453,7 @@ app.post('/api/brands/:brand/device/:id/stop', authenticate,
 // ============================================================================
 
 // GET device settings by device_id
-app.get('/api/device-settings/:deviceId', authenticate, requirePermission('settings.read'), async (req, res) => {
+app.get('/api/device-settings/:deviceId', authenticate, requirePermission('tank.read'), async (req, res) => {
   const deviceId = parseInt(req.params.deviceId);
   if (!Number.isInteger(deviceId) || deviceId <= 0) {
     return res.status(400).json({ error: 'Invalid device ID' });
@@ -2496,7 +2496,7 @@ app.get('/api/device-settings/:deviceId', authenticate, requirePermission('setti
 });
 
 // PUT (update) device settings
-app.put('/api/device-settings/:deviceId', authenticate, requirePermission('settings.write'), async (req, res) => {
+app.put('/api/device-settings/:deviceId', authenticate, requirePermission('tank.write'), async (req, res) => {
   const deviceId = parseInt(req.params.deviceId);
   if (!Number.isInteger(deviceId) || deviceId <= 0) {
     return res.status(400).json({ error: 'Invalid device ID' });
@@ -2561,7 +2561,7 @@ app.put('/api/device-settings/:deviceId', authenticate, requirePermission('setti
 
 // DELETE — clear every per-device override, falling back to the general
 // (system) settings for this device.
-app.delete('/api/device-settings/:deviceId', authenticate, requirePermission('settings.write'), async (req, res) => {
+app.delete('/api/device-settings/:deviceId', authenticate, requirePermission('tank.write'), async (req, res) => {
   const deviceId = parseInt(req.params.deviceId);
   if (!Number.isInteger(deviceId) || deviceId <= 0) {
     return res.status(400).json({ error: 'Invalid device ID' });
