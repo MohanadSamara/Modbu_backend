@@ -2138,7 +2138,7 @@ app.patch('/api/devices/:deviceId/last-seen', authenticate, requirePermission('d
 // devices.brand_id (nullable FK, ON DELETE SET NULL). Viewing needs
 // device.read; managing needs device.write.
 
-app.get('/api/brands', authenticate, requirePermission('device.read'), async (_, res) => {
+app.get('/api/brands', authenticate, requirePermission('brand.read'), async (_, res) => {
   try {
     const rows = await query(
       `SELECT b.brand_id AS id, b.brand_name AS name, b.created_at,
@@ -2153,7 +2153,7 @@ app.get('/api/brands', authenticate, requirePermission('device.read'), async (_,
   }
 });
 
-app.post('/api/brands', authenticate, requirePermission('device.write'), async (req, res) => {
+app.post('/api/brands', authenticate, requirePermission('brand.write'), async (req, res) => {
   const name = String(req.body?.name ?? '').trim();
   if (!name) return res.status(400).json({ error: 'Name required' });
   try {
@@ -2172,7 +2172,7 @@ app.post('/api/brands', authenticate, requirePermission('device.write'), async (
   }
 });
 
-app.put('/api/brands/:id', authenticate, requirePermission('device.write'), async (req, res) => {
+app.put('/api/brands/:id', authenticate, requirePermission('brand.write'), async (req, res) => {
   const id = parseInt(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid brand id' });
   const name = String(req.body?.name ?? '').trim();
@@ -2193,7 +2193,7 @@ app.put('/api/brands/:id', authenticate, requirePermission('device.write'), asyn
   }
 });
 
-app.delete('/api/brands/:id', authenticate, requirePermission('device.write'), async (req, res) => {
+app.delete('/api/brands/:id', authenticate, requirePermission('brand.write'), async (req, res) => {
   const id = parseInt(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid brand id' });
   try {

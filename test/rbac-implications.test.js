@@ -29,12 +29,13 @@ test('fuel.read is satisfied by device.control', () => {
   assert.ok(keysSatisfying('fuel.read').includes('device.control'));
 });
 
-test('datakom.read behaves like device.read, not a separate copy', () => {
+test('datakom.read is independent of device.read (Datakom Cloud is controllable on its own)', () => {
   const keys = keysSatisfying('datakom.read');
-  assert.ok(keys.includes('device.read'), 'device.read should satisfy datakom.read');
-  // Transitive: device.write → device.read → datakom.read
-  assert.ok(keys.includes('device.write'), 'device.write should satisfy datakom.read (transitively)');
-  assert.ok(keys.includes('device.connect'), 'device.connect should satisfy datakom.read (transitively)');
+  assert.ok(!keys.includes('device.read'), 'device.read must NOT satisfy datakom.read — Datakom Cloud access has to be grantable/revocable without touching device access');
+  assert.ok(!keys.includes('device.write'), 'device.write must NOT satisfy datakom.read');
+  // datakom.write still implies its own read, and needs device.read to link/unlink devices.
+  assert.ok(keysSatisfying('datakom.read').includes('datakom.write'), 'datakom.write should satisfy datakom.read');
+  assert.ok(keysSatisfying('device.read').includes('datakom.write'), 'datakom.write should satisfy device.read (needs to see devices to link them)');
 });
 
 test('fuel.read is satisfied by device.read', () => {

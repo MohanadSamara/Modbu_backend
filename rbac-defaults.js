@@ -34,6 +34,8 @@ const BUILTIN_PERMISSIONS = [
   { key: 'audit.read',       description: 'View audit log',             resource: 'audit',    level: 'read' },
   { key: 'datakom.read',     description: 'View live Datakom Rainbow data', resource: 'datakom', level: 'read' },
   { key: 'datakom.write',    description: 'Link / unlink Datakom devices',  resource: 'datakom', level: 'write' },
+  { key: 'brand.read',       description: 'View device brands',            resource: 'brand',   level: 'read' },
+  { key: 'brand.write',      description: 'Create/edit/delete brands',     resource: 'brand',   level: 'write' },
 
   // Dashboard (home page) — one permission per card/section, so an admin can
   // show or hide individual dashboard cards per role from the Permissions page,
@@ -66,6 +68,7 @@ const SYSTEM_ROLES = [
     permissions: [
       'device.read', 'device.connect', 'device.control', 'device.start', 'device.stop',
       'fuel.read', 'alarm.read', 'project.read', 'location.read', 'settings.read',
+      'datakom.read', 'brand.read',
       'dashboard.health', 'dashboard.alarms', 'dashboard.run_history', 'dashboard.fuel',
       'dashboard.device_map', 'dashboard.scada_promo', 'dashboard.stat_cards', 'dashboard.quick_access',
     ],
@@ -80,10 +83,12 @@ const SYSTEM_ROLES = [
 // scope as the grant. Kept in sync with the frontend copy in
 // FrontEndModbus/.../src/config/uiElements.js (PERMISSION_IMPLICATIONS).
 const PERMISSION_IMPLICATIONS = {
-  // Viewing a device includes viewing its live data, whatever the transport —
-  // datakom.read is NOT a separate parallel permission to hand out; it exists
-  // only to grant cloud-data access on its own, without full device access.
-  'device.read':      ['datakom.read', 'fuel.read'],
+  // Viewing a device includes viewing its own fuel reading, whatever the
+  // transport. datakom.read is deliberately NOT implied here (even though it
+  // was previously) — Datakom Cloud is its own page with its own nav link and
+  // adapter controls, and admins need to be able to grant/revoke it
+  // independently of general device access.
+  'device.read':      ['fuel.read'],
   'device.write':     ['device.read'],
   'device.connect':   ['device.read'],
   'device.control':   ['device.read', 'fuel.read'],
